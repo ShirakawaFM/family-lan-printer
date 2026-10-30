@@ -1,0 +1,5 @@
+Flask>=3.0,<4
+pywin32>=306
+Pillow>=10.0
+qrcode[pil]>=7.4
+pypdfium2>=4.0
