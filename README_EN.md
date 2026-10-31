@@ -8,7 +8,7 @@
 
 [简体中文](README.md) · [English](README_EN.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.1-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.0.2-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
@@ -207,36 +207,21 @@ All values live at the top of `print_server.py`:
 
 If you expose this through frp, use a strong password, a strong frp token, and HTTPS (Nginx/Caddy). Plain HTTP over the public internet exposes the password in transit.
 
-## Remote access with frp (optional)
+## Public deployment pack (optional)
 
-The web UI intentionally only shows the LAN QR. If you need 4G/5G access, map the LAN port through a VPS running frps.
+The web UI intentionally only shows the LAN QR. For 4G/5G access, use the ready-made pack in [`deploy-public/`](deploy-public/README.md) instead of writing frp configs by hand.
 
-`frps.ini`:
+The pack contains:
 
-```ini
-[common]
-bind_port = 7000
-token = use-a-long-random-token
-```
+- [`01-先填-部署信息.txt`](deploy-public/01-先填-部署信息.txt): fill in every `（）` placeholder;
+- [`server/02-云服务器-运行这个.sh`](deploy-public/server/02-云服务器-运行这个.sh): one-shot frps installer for Ubuntu;
+- [`windows/03-家里电脑-运行这个.ps1`](deploy-public/windows/03-家里电脑-运行这个.ps1): downloads frpc, writes config, creates a startup shortcut;
+- [`00-先看-公网部署教程.md`](deploy-public/00-先看-公网部署教程.md): full walkthrough and troubleshooting;
+- [`optional-https/HTTPS-可选教程.md`](deploy-public/optional-https/HTTPS-可选教程.md): optional Caddy HTTPS.
 
-`frpc.ini` on the Windows PC:
+Quick flow: open `7000/tcp` and `6000/tcp` in the cloud firewall, run the server script, run the Windows script with the same token, then open `http://YOUR_PUBLIC_SERVER_IP:6000` on 4G.
 
-```ini
-[common]
-server_addr = YOUR_PUBLIC_SERVER_IP
-server_port = 7000
-token = use-a-long-random-token
-
-[family_print]
-type = tcp
-local_ip = 127.0.0.1
-local_port = 5000
-remote_port = 6000
-```
-
-Open `7000/tcp` and `6000/tcp` in the cloud firewall, then visit `http://YOUR_PUBLIC_SERVER_IP:6000`.
-
-A complete frp tutorial (download links, Linux/Windows commands, HTTPS advice, autostart, troubleshooting) is included as comments at the end of `print_server.py`.
+> Plain HTTP exposes the password in transit. Use the optional HTTPS guide for long-term use, and change `ACCESS_PASSWORD` before exposing anything.
 
 ## Windows autostart
 
@@ -266,6 +251,7 @@ family-lan-printer/
 ├─ assets/banner.svg
 ├─ docs/screenshot-login.png
 ├─ docs/screenshot-print.png
+├─ deploy-public/             # public deployment pack and fill-in sheets
 └─ .github/workflows/python-check.yml
 ```
 
@@ -274,6 +260,7 @@ Runtime-only files (ignored by Git):
 ```text
 temp_print/
 qr_wall.png
+frp/, frpc.toml, frpc.log
 server.log
 server.err.log
 ```

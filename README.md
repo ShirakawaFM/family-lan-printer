@@ -8,7 +8,7 @@
 
 [简体中文](README.md) · [English](README_EN.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.1-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.0.2-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
@@ -34,7 +34,7 @@
 - [配置项](#配置项)
 - [打印规则](#打印规则)
 - [安全设计](#安全设计)
-- [外网访问（frp，可选）](#外网访问frp可选)
+- [公网部署包（傻瓜式）](#公网部署包傻瓜式)
 - [Windows 开机自启](#windows-开机自启)
 - [项目结构](#项目结构)
 - [已知限制](#已知限制)
@@ -96,7 +96,8 @@
 | **临时文件自动清理** | 文字、图片和文件都先存到 `temp_print/`，任务结束 30 秒后自动删除；只预览未打印的文件 30 分钟后清理 |
 | **友好错误** | 打印失败时直接显示可能原因（缺纸/卡纸/离线/盖未关/缺墨等）和对应解决办法，不输出 Python 堆栈或英文错误码 |
 | **串行状态轮询** | 提交后显示「正在排队打印」，实际打印失败会自动变成「打印失败」并展开处理办法 |
-| **外网访问教程** | 代码末尾附带 frp 内网穿透完整教程；网页永远只展示内网二维码 |
+| **外网访问教程** | 代码末尾附带 frp 完整教程；另提供 [`deploy-public/`](deploy-public/README.md) 傻瓜式公网部署包 |
+| **公网部署包** | 带填写单、云服务器一键脚本、Windows 一键脚本和可选 HTTPS 教程，所有需要填的地方都用 `（）` 标出 |
 | **开机自启教程** | 代码末尾附带 Windows 任务计划程序详细步骤，开机自动运行 |
 | **单文件部署** | 业务代码只有 `print_server.py` 一个文件，不生成前端构建产物 |
 
@@ -392,49 +393,26 @@ python print_server.py
 
 ---
 
-## 外网访问（frp，可选）
+## 公网部署包（傻瓜式）
 
-默认只支持同一个 WiFi。如果确实需要在 4G/5G 下使用，可以用 frp 把内网端口映射到有公网 IP 的云服务器。
+默认只支持同一个 WiFi。要在 4G/5G 下使用，直接用 [`deploy-public/`](deploy-public/README.md) 里的公网部署包，不用自己写 frp 配置。
 
-> 网页界面永远只显示内网二维码；外网地址不要贴墙，也不要发到群里。
+### 包里的东西
 
-### 服务端 `frps.ini`
+- [`01-先填-部署信息.txt`](deploy-public/01-先填-部署信息.txt)：把 `（）` 里的内容填成自己的；
+- [`server/02-云服务器-运行这个.sh`](deploy-public/server/02-云服务器-运行这个.sh)：Ubuntu 云服务器一键安装 frps；
+- [`windows/03-家里电脑-运行这个.ps1`](deploy-public/windows/03-家里电脑-运行这个.ps1)：Windows 一键下载 frpc、写配置、设置开机启动；
+- [`00-先看-公网部署教程.md`](deploy-public/00-先看-公网部署教程.md)：完整步骤和排错；
+- [`optional-https/HTTPS-可选教程.md`](deploy-public/optional-https/HTTPS-可选教程.md)：给公网入口加 HTTPS。
 
-```ini
-[common]
-bind_port = 7000
-token = 换成一段很长的随机密码
-```
+### 最短流程
 
-### 家里电脑 `frpc.ini`
+1. 云服务器安全组放行 `（frp 控制端口，默认 7000）/TCP` 和 `（外网访问端口，默认 6000）/TCP`；
+2. 上传并运行 `02-云服务器-运行这个.sh`，记下脚本生成的 `frp token`；
+3. 家里 Windows 运行 `03-家里电脑-运行这个.ps1`，填同一个 IP、端口和 token；
+4. 手机用 4G 打开 `http://（云服务器公网 IP）:（外网访问端口）`。
 
-```ini
-[common]
-server_addr = 你的云服务器公网IP
-server_port = 7000
-token = 换成和 frps.ini 完全一样的随机密码
-
-[family_print]
-type = tcp
-local_ip = 127.0.0.1
-local_port = 5000
-remote_port = 6000
-```
-
-启动：
-
-```bat
-frps.exe -c frps.ini
-frpc.exe -c frpc.ini
-```
-
-外网访问：
-
-```text
-http://你的公网IP:6000
-```
-
-云服务器安全组放行 `7000/TCP` 和 `6000/TCP`。完整下载地址、Windows/Linux 启动方式、HTTPS 建议、开机自启和排错步骤，见 `print_server.py` **文件末尾的完整 frp 教程注释**。
+> 公网 HTTP 的密码不是加密传输。长期使用请按可选教程加 HTTPS，并务必修改 `ACCESS_PASSWORD`。网页界面永远只展示内网二维码；外网地址不要贴墙，也不要发到群里。
 
 ---
 
@@ -470,6 +448,12 @@ family-lan-printer/
 ├─ docs/
 │  ├─ screenshot-login.png
 │  └─ screenshot-print.png
+├─ deploy-public/                 # 公网部署包：填写单、脚本、HTTPS 教程
+│  ├─ 00-先看-公网部署教程.md
+│  ├─ 01-先填-部署信息.txt
+│  ├─ server/
+│  ├─ windows/
+│  └─ optional-https/
 └─ .github/
    └─ workflows/
       └─ python-check.yml       # 语法检查 CI
@@ -480,6 +464,8 @@ family-lan-printer/
 ```text
 temp_print/                     # 临时文字、图片、文件目录，30 秒/30 分钟自动清理
 qr_wall.png                     # 贴墙二维码，包含你的局域网 IP，不建议提交到仓库
+frp/、frpc.toml、frpc.log       # 公网部署脚本生成，已在 .gitignore 中忽略
+启动家庭打印.bat / 停止家庭打印.bat # 公网部署脚本生成
 server.log / server.err.log     # 可选运行日志
 ```
 
