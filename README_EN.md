@@ -1,0 +1,332 @@
+<div align="center">
+
+<img src="assets/banner.svg" alt="Family LAN Print: scan with WeChat, print text, photos and files" width="100%" />
+
+# Family LAN Print
+
+**A dead-simple home print server for Windows. Phones on the same Wi-Fi scan a QR code, enter a shared password, and print text, photos, or files from the phone / WeChat chat history.**
+
+[简体中文](README.md) · [English](README_EN.md)
+
+[![Version](https://img.shields.io/badge/version-1.0.0-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/ShirakawaFM/family-lan-printer?style=social)](https://github.com/ShirakawaFM/family-lan-printer/stargazers)
+
+</div>
+
+> This is **not** cloud printing. Text, images and files stay on your Windows PC and are deleted 30 seconds after each print job. Files that are only previewed are cleaned up after 30 minutes. No accounts, no telemetry, no ads.
+
+---
+
+## Why
+
+The printer is connected to a Windows PC at home. Printing a photo or a note usually means: find the PC, find the file, open it, click print. Elderly parents and children cannot do that alone.
+
+This project reduces it to:
+
+1. Run one Python file on the Windows PC.
+2. Print `qr_wall.png` and stick it next to the printer.
+3. Phone on the same Wi-Fi: scan → enter password → type or choose a photo → tap print.
+
+## Preview
+
+> The QR code in the screenshot is a demo link (`http://192.168.1.100:5000`), not a real address.
+
+| Password page | Print page |
+| :---: | :---: |
+| <img src="docs/screenshot-login.png" alt="Password page" width="320" /> | <img src="docs/screenshot-print.png" alt="Text and photo print page" width="320" /> |
+
+## Features
+
+- **QR access** — detects the LAN IPv4 automatically, serves the page at `http://<ip>:5000`, and exports a print-ready `qr_wall.png`.
+- **Shared password** — one family password, not a user account system. The console only prints a masked version.
+- **A4 text printing** — SimSun, 24 pt, left aligned, 20 mm margins, automatic wrapping and pagination.
+- **Photo printing** — jpg / png / webp, max 8 MB; EXIF orientation fixed, aspect ratio preserved, centered on A4, no stretching or cropping.
+- **Phone / WeChat chat files** — pick PDF, Word, Excel, PowerPoint, TXT, HTML or images from the phone or the WeChat file picker. PDF/Office keep their original layout; text is reflowed.
+- **Print preview** — the first 3 pages are rendered as real page thumbnails; the user must confirm before all pages are printed.
+- **Serial print queue** — one worker consumes `queue.Queue`; jobs never print concurrently.
+- **Auto cleanup** — every temp file is deleted 30 seconds after its job ends; preview-only files expire after 30 minutes.
+- **Friendly errors** — the browser only shows two Chinese messages; stack traces and English error codes stay in the console.
+- **Optional remote access** — a complete frp tutorial is included at the end of the Python file. The web UI never displays an external QR code.
+- **Single-file deployment** — no frontend build, database, Docker, or cloud dependency.
+- **One-click-ish setup** — `pip install -r requirements.txt`, then `python print_server.py`.
+
+**Out of scope:** OCR, WeChat bots, cloud sync, Wi-Fi setup QR codes, user registration, print preview, layout controls.
+
+## How it works
+
+```text
+Phone / WeChat browser
+        │ HTTP on the same Wi-Fi
+        ▼
+Flask 0.0.0.0:5000
+  ├─ GET  /              password page / print page
+  ├─ POST /unlock        shared password → session
+  ├─ POST /print/text    text → temp_print/<task>.txt
+  ├─ POST /print/image   validated image → temp_print/<task>.<ext>
+  ├─ POST /print/file    file → temp preview (PDF/Office/TXT/HTML/image)
+  ├─ POST /print/file/id confirm and queue the prepared file
+  └─ GET  /status/<id>   queued / printing / done / error
+        │
+        ▼
+queue.Queue (FIFO)
+        ▼
+single print-worker thread
+  ├─ text: Pillow → A4 pages
+  ├─ image: EXIF + contain + center on A4
+  ├─ PDF: pypdfium2 render pages
+  ├─ Office: COM → PDF → render pages
+  ├─ PPT: Slides.Export → PNG → A4 pages
+  └─ pywin32 / win32ui → Windows default printer
+        │
+        ▼
+temp file deleted 30 s after the job ends
+```
+
+The single-consumer queue exists for a reason: concurrent `StartDoc` calls can confuse spooler/driver combinations, reorder jobs, or lock up the printer. One worker means strict FIFO.
+
+## Quick start
+
+### Requirements
+
+| Item | Requirement |
+| --- | --- |
+| OS | Windows 10 / 11 |
+| Python | 3.10+ (tested on 3.14) |
+| Python deps | Flask, Pillow, qrcode, pypdfium2, pywin32 |
+| Printer | installed in Windows and set as **default** |
+| Network | PC and phone on the same Wi-Fi |
+| Paper | A4 |
+| Office | Microsoft Office is required for Word/Excel/PPT layout conversion; PDF/TXT/HTML/images work without it |
+
+### Install
+
+```bat
+cd /d D:\family-print
+python -m pip install -r requirements.txt
+```
+
+### Change the password
+
+In `print_server.py`:
+
+```python
+ACCESS_PASSWORD = "123456"
+```
+
+Change it before exposing the service to your family. `123456` is only a first-run default.
+
+### Run
+
+```bat
+python print_server.py
+```
+
+The console prints:
+
+```text
+✅ LAN URL: http://192.168.1.100:5000
+✅ Wall QR exported: qr_wall.png
+✅ Access password: 1****6
+✅ Keep the PC and printer powered on.
+```
+
+Allow Python through Windows Firewall for **Private networks** when prompted. Keep the console window open.
+
+### Print the wall QR
+
+Print `qr_wall.png` from the project folder and stick it next to the printer. Scan with WeChat, enter the password, and print.
+
+## Configuration
+
+All values live at the top of `print_server.py`:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | Listen on all interfaces |
+| `PORT` | `5000` | HTTP port |
+| `ACCESS_PASSWORD` | `123456` | Shared family password; change it |
+| `ENABLE_FRP_GUIDE` | `True` | Console hint for the frp tutorial; never shows an external QR |
+| `EXPORT_QR_IMAGE` | `True` | Write `qr_wall.png` on startup |
+| `QR_WALL_FILENAME` | `qr_wall.png` | Wall QR file name |
+| `LAN_IP_OVERRIDE` | `""` | Manual LAN IPv4 for multi-NIC/VPN machines |
+| `TEMP_DIR_NAME` | `temp_print` | Temp directory |
+| `PAGE_MARGIN_MM` | `20.0` | A4 margin in millimetres |
+| `TEXT_FONT_SIZE_PT` | `24` | Text size in points |
+| `TEXT_LINE_SPACING` | `1.5` | Line-height multiplier |
+| `RENDER_DPI` | `300` | Page render DPI |
+| `IMAGE_MAX_BYTES` | `8388608` | 8 MB image limit |
+| `MAX_IMAGE_PIXELS` | `50000000` | Pixel limit to avoid memory blow-ups |
+| `MAX_TEXT_CHARS` | `20000` | Text limit per job |
+| `FILE_MAX_BYTES` | `52428800` | Phone/chat file limit, 50 MB |
+| `FILE_PREVIEW_PAGES` | `3` | Pages shown in the phone preview |
+| `FILE_PREVIEW_DPI` | `96` | Preview render DPI |
+| `PDF_PRINT_DPI` | `200` | PDF print render DPI |
+| `MAX_FILE_TEXT_CHARS` | `50000` | Text-file limit |
+| `FILE_TTL_SECONDS` | `1800` | Unprinted preview lifetime |
+| `DELETE_AFTER_SECONDS` | `30` | Temp-file retention after a job |
+| `SESSION_LIFETIME_DAYS` | `30` | Login session lifetime |
+
+## Print rules
+
+### Text
+
+- A4 portrait
+- SimSun 24 pt (falls back to Microsoft YaHei / DengXian / SimHei)
+- Left aligned
+- Fixed 20 mm margins
+- Automatic line wrapping and pagination
+- No layout options in the browser
+
+### Images
+
+- jpg / jpeg / png / webp, max 8 MB
+- EXIF orientation corrected
+- Aspect ratio preserved, scaled to fit the A4 content area
+- Centered, never cropped or stretched
+- Transparent areas flattened onto white
+
+### Printer
+
+- Uses the Windows default printer only.
+- Best-effort preflight status check for paused, error, paper jam, paper out, offline, no toner, door open, etc.
+- Some drivers do not report status; in that case the spooler result is all we can know.
+- Set the printer paper size to A4.
+
+## Security
+
+- Shared password + signed session cookie; no user registration.
+- The wall QR contains only the LAN URL.
+- The web UI never renders a public/external QR code.
+- Temp files are deleted 30 seconds after each job.
+- No cloud services, no third-party APIs, no telemetry.
+- Frontend errors are fixed Chinese messages; details go to the console.
+- Uploaded images are checked by extension, size, real Pillow format, and pixel count.
+
+If you expose this through frp, use a strong password, a strong frp token, and HTTPS (Nginx/Caddy). Plain HTTP over the public internet exposes the password in transit.
+
+## Remote access with frp (optional)
+
+The web UI intentionally only shows the LAN QR. If you need 4G/5G access, map the LAN port through a VPS running frps.
+
+`frps.ini`:
+
+```ini
+[common]
+bind_port = 7000
+token = use-a-long-random-token
+```
+
+`frpc.ini` on the Windows PC:
+
+```ini
+[common]
+server_addr = YOUR_PUBLIC_SERVER_IP
+server_port = 7000
+token = use-a-long-random-token
+
+[family_print]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 5000
+remote_port = 6000
+```
+
+Open `7000/tcp` and `6000/tcp` in the cloud firewall, then visit `http://YOUR_PUBLIC_SERVER_IP:6000`.
+
+A complete frp tutorial (download links, Linux/Windows commands, HTTPS advice, autostart, troubleshooting) is included as comments at the end of `print_server.py`.
+
+## Windows autostart
+
+Use Task Scheduler instead of the Startup folder:
+
+1. `Win + R` → `taskschd.msc`.
+2. Create Task (not Create Basic Task).
+3. General: run only when the user is logged on.
+4. Trigger: at logon, delay 30 seconds.
+5. Action: start `python.exe` or `pythonw.exe`.
+6. Arguments: `"D:\family-print\print_server.py"`.
+7. Start in: `D:\family-print`.
+8. Allow restart on failure; disable the "stop task if it runs longer than" option.
+
+Start with `python.exe` so you can see the console. Switch to `pythonw.exe` only after everything works.
+
+## Project layout
+
+```text
+family-lan-printer/
+├─ print_server.py          # Flask app, print worker, queue, HTML UI, docs comments
+├─ requirements.txt
+├─ README.md
+├─ README_EN.md
+├─ LICENSE
+├─ CHANGELOG.md
+├─ assets/banner.svg
+├─ docs/screenshot-login.png
+├─ docs/screenshot-print.png
+└─ .github/workflows/python-check.yml
+```
+
+Runtime-only files (ignored by Git):
+
+```text
+temp_print/
+qr_wall.png
+server.log
+server.err.log
+```
+
+## Known limitations
+
+- Windows only; uses `pywin32` and the Windows printing API.
+- Default printer only; no printer picker.
+- Printer status is best-effort and driver-dependent.
+- A4 portrait layout only; set the printer paper size to A4.
+- If the PC's LAN IP changes, regenerate and reprint `qr_wall.png`.
+- `pythonw.exe` hides the console and therefore the logs.
+- Phone and PC must be on the same LAN; guest Wi-Fi / AP isolation will block access.
+- Word/Excel/PPT need Microsoft Office installed for layout-preserving conversion; otherwise save as PDF first.
+- The browser cannot read the WeChat chat database directly. The file picker can only open files through the phone/WeChat document picker.
+- Preview shows the first 3 pages only; printing outputs all pages.
+- Text and chat exports are reflowed; PDF/Office/PPT keep their original layout.
+
+## FAQ
+
+**`ERR_CONNECTION_REFUSED` on the phone.** The server is not running or the console was closed. Open `http://127.0.0.1:5000` on the PC first, then use the LAN URL shown in the console and check Windows Firewall.
+
+**PC opens the page but the phone does not.** Check same Wi-Fi, AP isolation, firewall, and `LAN_IP_OVERRIDE` for multi-NIC/VPN machines.
+
+**No default printer.** Set it in Windows Settings → Bluetooth & devices → Printers & scanners, then print a test page from Notepad.
+
+**Photo upload fails.** Only jpg/png/webp up to 8 MB. Convert HEIC photos to jpg first.
+
+**File preview fails / Office cannot open.** Make sure the file opens in Word/Excel/PowerPoint on the PC. Without Microsoft Office, save it as PDF first. PDF/TXT/HTML/images do not need Office.
+
+**Where are WeChat chat files?** After tapping the file input, look for the "Chat files" / "Files" entry in the phone picker. If the current WeChat version does not show it, save the file to the phone first.
+
+**Why does preview show only 3 pages?** To keep the phone UI fast and prevent accidental long prints. The title shows the total page count; confirming prints all pages.
+
+**Why no "print completed" message?** Windows spooler accepts a job before paper comes out. The UI only promises "queued" or "failed", not a fake completion event.
+
+## Development
+
+```bat
+python -m py_compile print_server.py
+python print_server.py
+```
+
+CI runs `py_compile` on a Windows runner. It does not print, because GitHub Actions has no printer.
+
+## Contributing
+
+Issues and pull requests are welcome. Please keep the project single-file, avoid frontend builds/databases/cloud services, and do not add out-of-scope features such as OCR, bots, or user accounts.
+
+## License
+
+[MIT](LICENSE) © 2026 ShirakawaFM
+
+## Disclaimer
+
+This is a personal home tool, not a supported commercial product. Use it at your own risk. The author is not responsible for failed prints, wasted paper, driver issues, network exposure, or data loss.

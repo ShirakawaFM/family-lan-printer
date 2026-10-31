@@ -1,0 +1,27 @@
+# Runtime
+temp_print/
+qr_wall.png
+server.log
+server.err.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local preview artifacts
+docs/preview_*.html
+docs/_make_preview*.py
