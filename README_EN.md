@@ -6,7 +6,7 @@
 
 English · [简体中文](README.md)
 
-[![Version](https://img.shields.io/badge/version-1.1.0-8B5CF6?style=flat-square&logo=github&logoColor=white)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-8B5CF6?style=flat-square&logo=github&logoColor=white)](CHANGELOG.md)
 [![CI](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml/badge.svg)](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
@@ -92,9 +92,34 @@ This project reduces it to:
 </tr>
 </table>
 
+<br>
+
+<table>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-preview.png"><img src="docs/screenshot-preview.png" alt="Print preview with the layout editor on the left and the live render on the right" width="100%" /></a>
+<br><sub><b>Preview page</b> — layout editor on the left, live re-pagination on the right</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-preview-landscape.png"><img src="docs/screenshot-preview-landscape.png" alt="Landscape layout with a large font" width="100%" /></a>
+<br><sub><b>Landscape + large font</b> — what you see is what the printer outputs</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-preview-printer-error.png"><img src="docs/screenshot-preview-printer-error.png" alt="Printer error notice on the preview page" width="100%" /></a>
+<br><sub><b>Printer problem</b> — the reason and the fix, before you waste paper</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-preview-mobile.png"><img src="docs/screenshot-preview-mobile.png" alt="Mobile preview page" width="60%" /></a>
+<br><sub><b>Mobile preview</b> — same controls, stacked for a phone screen</sub>
+</td>
+</tr>
+</table>
+
 </details>
 
-The UI uses a modern, motion-rich style: dark/light themes (follows the system, manual toggle included), gradient glow background, glassy cards, tabbed print modes and spring micro-interactions. A ~1 s branded splash animation plays on the print page and fades out as soon as the page is ready. Buttons stay large and full-width (56 px tall, 16 px+ font) so touch use by kids and grandparents is unaffected.
+The UI uses a modern, motion-rich style: dark/light themes (follows the system, manual toggle included), gradient glow background, glassy cards, tabbed print modes and spring micro-interactions. A ~1 s branded splash animation plays on the print page and fades out as soon as the page is ready. Buttons stay large and full-width (56 px tall, 16 px+ font) so touch use by kids and grandparents is unaffected. Files show three thumbnail pages on the print page, then go through the preview page before anything is printed.
 
 ## Features
 
@@ -102,8 +127,9 @@ The UI uses a modern, motion-rich style: dark/light themes (follows the system, 
 - **Shared password** — one family password, not a user account system. The console only prints a masked version.
 - **A4 text printing** — SimSun, 24 pt, left aligned, 20 mm margins, automatic wrapping and pagination.
 - **Photo printing** — jpg / png / webp, max 8 MB; EXIF orientation fixed, aspect ratio preserved, centered on A4, no stretching or cropping.
-- **Phone / WeChat chat files** — pick PDF, Word, Excel, PowerPoint, TXT, HTML or images from the phone or the WeChat file picker. PDF/Office keep their original layout; text is reflowed.
-- **Print preview** — the first 3 pages are rendered as real page thumbnails; the user must confirm before all pages are printed.
+- **Phone / WeChat chat files** — pick PDF, Word, Excel, PowerPoint, TXT, HTML or images. Inside WeChat the chat conversation opens directly, with no "save to phone" step; outside WeChat it falls back to the native file picker.
+- **Mandatory print preview** — all three entries (text / image / file) open a preview page first. It ships a layout editor: paper size, orientation, per-side margins, scale, font size and line spacing. Every change re-paginates live and matches the printer output exactly. Two exits only: **Print** or **Back to editing** (cancel changes nothing).
+- **Printer self-check on startup** — a background probe reports the default printer status (ready / out of paper / offline / ...) in a status bar, with a re-check button and a shortcut to the Windows printer settings. It never blocks startup.
 - **Serial print queue** — one worker consumes `queue.Queue`; jobs never print concurrently.
 - **Auto cleanup** — every temp file is deleted 30 seconds after its job ends; preview-only files expire after 30 minutes.
 - **Friendly errors** — the browser shows the likely cause (paper out, paper jam, offline, door open, no toner, etc.) and a matching fix; stack traces and English error codes stay in the console.
@@ -111,7 +137,7 @@ The UI uses a modern, motion-rich style: dark/light themes (follows the system, 
 - **Single-file deployment** — no frontend build, database, Docker, or cloud dependency.
 - **One-click-ish setup** — `pip install -r requirements.txt`, then `python print_server.py`.
 
-**Out of scope:** OCR, WeChat bots, cloud sync, Wi-Fi setup QR codes, user registration, layout controls.
+**Out of scope:** OCR, WeChat bots, cloud sync, Wi-Fi setup QR codes, user registration, and uploading anything to an external server. WeChat picking uses the official `chooseMessageFile` JS-SDK: WeChat shows the conversation file list and only files the user actively picks are handed to the page. The chat database is never read or uploaded.
 
 ## How it works
 
@@ -120,13 +146,25 @@ Phone / WeChat browser
         │ HTTP on the same Wi-Fi
         ▼
 Flask 0.0.0.0:5000
-  ├─ GET  /              password page / print page
-  ├─ POST /unlock        shared password → session
-  ├─ POST /print/text    text → temp_print/<task>.txt
-  ├─ POST /print/image   validated image → temp_print/<task>.<ext>
-  ├─ POST /print/file    file → temp preview (PDF/Office/TXT/HTML/image)
-  ├─ POST /print/file/id confirm and queue the prepared file
-  └─ GET  /status/<id>   queued / printing / done / error
+  ├─ GET   /                      password page / print page
+  ├─ POST  /unlock                shared password → session
+  ├─ GET   /qr.png                LAN QR (immutable cache)
+  │
+  ├─ preview session (the only print path)
+  │   ├─ POST /preview/text          text → session
+  │   ├─ POST /preview/image         image → session
+  │   ├─ POST /preview/file          file → session
+  │   ├─ POST /preview/file/<id>     prepared file → session
+  │   ├─ GET  /preview/<id>          preview page (layout editor)
+  │   ├─ POST /preview/<id>/render   re-paginate with the current layout
+  │   ├─ POST /preview/<id>/print    only now → print queue
+  │   └─ POST /preview/<id>/cancel   discard, source untouched
+  │
+  ├─ POST  /print/file            file preparation (preview only)
+  ├─ GET   /status/printer        cached printer self-check snapshot
+  ├─ POST  /status/printer/refresh   re-run the probe
+  ├─ GET   /wechat/jsconfig       WeChat JS-SDK signature
+  └─ GET   /status/<id>           printing / done / error
         │
         ▼
 queue.Queue (FIFO)
@@ -189,6 +227,8 @@ The console prints:
 ✅ Wall QR exported: qr_wall.png
 ✅ Access password: 1****6
 ✅ Keep the PC and printer powered on.
+ℹ️ Web service is ready; finishing the last steps in the background…
+🖨️ Default printer ready: hp LaserJet 1010 HB (probed in the background)
 ```
 
 Allow Python through Windows Firewall for **Private networks** when prompted. Keep the console window open.
@@ -196,6 +236,66 @@ Allow Python through Windows Firewall for **Private networks** when prompted. Ke
 ### Print the wall QR
 
 Print `qr_wall.png` from the project folder and stick it next to the printer. Scan with WeChat, enter the password, and print.
+
+## Print preview (mandatory)
+
+```text
+print page  ──►  POST /preview/...  ──►  GET /preview/<id>  ──►  [ Print ]  ──►  queue
+   ▲                                        │  ▲                                  
+   │                                        │  │  layout change                   
+   └──────  cancel / back (nothing written) ─┘  └─► POST /preview/<id>/render      
+```
+
+- All three entries (text, image, file) land on the preview page. Direct calls to `POST /print/text`, `POST /print/image` or `POST /print/file/<id>` are rejected with **HTTP 403** (`need_preview`), so no shortcut, batch action or legacy button can bypass the preview.
+- The editor exposes paper size (A4 / A5 / B5 / Letter / Legal), orientation, four independent margins, scale, body font size and line spacing:
+
+  | Control | Range |
+  | --- | --- |
+  | Margins | 0–60 mm per side |
+  | Scale | 25–200 % |
+  | Font size | 6–72 pt |
+  | Line spacing | 0.8–3.0 |
+
+- Everything is computed in millimetres and points and converted to pixels only at the last step, so the 96 DPI preview and the 300 DPI print share one geometry: same page breaks, same wrapping, same clipping.
+- The preview page has exactly two exits. **Print** queues the job; **Back to editing** discards the session and leaves the original content byte-for-byte unchanged.
+- Every control has a one-click reset, and the last used layout is remembered for the next job.
+
+## Picking files from WeChat
+
+Inside WeChat the **Pick from WeChat chat** button calls `wx.chooseMessageFile` directly, so files are read straight from the conversation — no "save to phone, then upload" detour. Outside WeChat (or when the JS-SDK is not configured) the button hides or falls back to the native file picker, and the rest of the flow is identical.
+
+| Capability | Detail |
+| --- | --- |
+| Entry | WeChat built-in browser only (`MicroMessenger` UA) |
+| Requirement | `WECHAT_JSAPI_ENABLED = True` plus a public-account `AppID` / `AppSecret`, and the domain registered as a JS API security domain |
+| Source | Files that appeared in the current user's chats |
+| Types | Whatever the chat holds; the server still validates by extension and real content |
+| Count | Up to 100 files per `chooseMessageFile` call (WeChat limit) |
+| Size | Capped by `FILE_MAX_BYTES` (50 MB) |
+
+| Failure | Fallback |
+| --- | --- |
+| Not opened in WeChat | Button hidden, native file picker used |
+| AppID / AppSecret missing or signature fails | Native file picker used |
+| User cancels the picker | Return to the page, nothing submitted |
+| `chooseMessageFile` unsupported / call fails | Native file picker used, **not** an error notification |
+| File over the size limit or wrong type | Same message as the native picker path |
+
+The fallback never blocks the main flow: it does not pop a confusing WeChat error, does not require the user to retry in a different way, and the picked file goes through exactly the same validation and preview.
+
+## Printer self-check on startup
+
+A background thread probes the default printer right after the port is bound. The result is cached and served by `GET /status/printer`; the web UI shows a status bar with a **Re-check** button and a link to `ms-settings:printers`.
+
+| State | UI | Action offered |
+| --- | --- | --- |
+| `ok` | Ready, with the printer name | None |
+| `no_printer` | No default printer set | Open Windows printer settings |
+| `offline` / `error` / `paper_out` / `paper_jam` / `toner_low` / `door_open` / `paused` | Reason + matching fix | Re-check, open printer settings |
+| `unknown` | Could not confirm the state | Re-check (8 s timeout) |
+
+- The probe runs on a daemon thread with a concurrency guard and an 8-second timeout. **Startup never waits for it**, so "scannable" is not delayed by a slow or absent spooler.
+- The snapshot is reused for later requests, so repeated page loads cost nothing.
 
 ## Configuration
 
@@ -226,32 +326,55 @@ All values live at the top of `print_server.py`:
 | `FILE_TTL_SECONDS` | `1800` | Unprinted preview lifetime |
 | `DELETE_AFTER_SECONDS` | `30` | Temp-file retention after a job |
 | `SESSION_LIFETIME_DAYS` | `30` | Login session lifetime |
+| `REQUIRE_PREVIEW` | `True` | Enforce preview-before-print; set `False` to restore direct printing |
+| `PREVIEW_TTL_SECONDS` | `1800` | Preview session lifetime |
+| `MAX_PREVIEW_SESSIONS` | `20` | Concurrent preview sessions before the oldest is dropped |
+| `PREVIEW_DPI` | `96` | Preview render DPI (same geometry as printing) |
+| `PREVIEW_MAX_RETURN_PAGES` | `9` | Pages returned per render request |
+| `PREVIEW_MAX_RENDER_PAGES` | `40` | Hard cap on pages generated per render |
+| `PREVIEW_THUMB_EDGE` | `760` | Preview image long edge in pixels |
+| `PAGE_SIZES_MM` | A4/A5/B5/Letter/Legal | Paper sizes offered in the editor |
+| `DEFAULT_PAGE_SIZE` | `A4` | Default paper |
+| `DEFAULT_ORIENTATION` | `portrait` | Default orientation |
+| `DEFAULT_SCALE_PERCENT` | `100.0` | Default scale |
+| `LAYOUT_LIMITS` | margins 0–60 mm / scale 25–200 % / font 6–72 pt / line spacing 0.8–3.0 | Clamping bounds |
+| `PDF_USE_LAYOUT_PAGE` | `True` | Let PDF pages follow the chosen paper and margins |
+| `PRINTER_PROBE_ENABLED` | `True` | Startup printer self-check |
+| `PRINTER_PROBE_TIMEOUT` | `8.0` | Probe timeout in seconds |
+| `WECHAT_JSAPI_ENABLED` | `False` | WeChat JS-SDK chat file picking |
+| `WECHAT_APPID` | `""` | Public-account AppID; blank falls back to the native picker |
+| `WECHAT_APPSECRET` | `""` | Public-account AppSecret; blank falls back to the native picker |
 
 ## Print rules
 
 ### Text
 
-- A4 portrait
-- SimSun 24 pt (falls back to Microsoft YaHei / DengXian / SimHei)
+- A4 portrait by default; A5 / B5 / Letter / Legal can be chosen in the preview
+- SimSun 24 pt by default, 6–72 pt in the preview (falls back to Microsoft YaHei / DengXian / SimHei)
 - Left aligned
-- Fixed 20 mm margins
+- 20 mm margins by default, 0–60 mm per side in the preview
+- 1.5 line spacing by default, 0.8–3.0 in the preview
 - Automatic line wrapping and pagination
-- No layout options in the browser
+- No layout controls on the print page; they all live in the mandatory preview page
+
+> These are the **defaults**. Preview-time layout applies to that one job only: the source text is never rewritten.
 
 ### Images
 
 - jpg / jpeg / png / webp, max 8 MB
 - EXIF orientation corrected
 - Aspect ratio preserved, scaled to fit the A4 content area
-- Centered, never cropped or stretched
+- Centered, never stretched; an additional 25–200 % scale is available in the preview
 - Transparent areas flattened onto white
+- Default layout (100 % + A4 + 20 mm) is pixel-identical to the pre-preview behaviour; pushing margins or scale past the sheet clips exactly as it will print
 
 ### Printer
 
 - Uses the Windows default printer only.
+- One background self-check at startup; the result stays visible in a status bar (see [Printer self-check on startup](#printer-self-check-on-startup)).
 - Best-effort preflight status check for paused, error, paper jam, paper out, offline, no toner, door open, etc.
 - Some drivers do not report status; in that case the spooler result is all we can know.
-- Set the printer paper size to A4.
+- Set the printer paper size to A4, or to whatever paper you picked in the preview.
 
 ## Security
 
@@ -313,6 +436,14 @@ family-lan-printer/
 │  └─ footer.svg
 ├─ docs/screenshot-login.png
 ├─ docs/screenshot-print.png
+├─ docs/screenshot-print-light.png
+├─ docs/screenshot-print-mobile.png
+├─ docs/screenshot-splash.png
+├─ docs/screenshot-preview.png
+├─ docs/screenshot-preview-landscape.png
+├─ docs/screenshot-preview-printer-error.png
+├─ docs/screenshot-preview-mobile.png
+├─ docs/social-preview.png
 ├─ deploy-public/             # public deployment pack and fill-in sheets
 └─ .github/workflows/python-check.yml
 ```
@@ -332,13 +463,15 @@ server.err.log
 - Windows only; uses `pywin32` and the Windows printing API.
 - Default printer only; no printer picker.
 - Printer status is best-effort and driver-dependent.
-- A4 portrait layout only; set the printer paper size to A4.
+- A4 portrait is the default layout; the printer paper size must match the paper you pick in the preview.
 - If the PC's LAN IP changes, regenerate and reprint `qr_wall.png`.
 - `pythonw.exe` hides the console and therefore the logs.
 - Phone and PC must be on the same LAN; guest Wi-Fi / AP isolation will block access.
 - Word/Excel/PPT need Microsoft Office installed for layout-preserving conversion; otherwise save as PDF first.
-- The browser cannot read the WeChat chat database directly. The file picker can only open files through the phone/WeChat document picker.
-- Preview shows the first 3 pages only; printing outputs all pages.
+- WeChat chat picking needs the WeChat built-in browser plus an AppID/AppSecret with the domain registered as a JS API security domain. Otherwise the native file picker is used, with no error and no interruption.
+- `chooseMessageFile` allows at most 100 files per call and only files present in the user's chats.
+- Layout values are clamped to `LAYOUT_LIMITS`, so negative margins or a 0 pt font are impossible.
+- The preview returns at most `PREVIEW_MAX_RETURN_PAGES` pages (9); printing still outputs every page.
 - Text and chat exports are reflowed; PDF/Office/PPT keep their original layout.
 
 ## FAQ
@@ -351,11 +484,19 @@ server.err.log
 
 **Photo upload fails.** Only jpg/png/webp up to 8 MB. Convert HEIC photos to jpg first.
 
+**Where do I pick WeChat chat files?** Inside WeChat, use **Pick from WeChat chat** to open the conversation file list directly. If the button is missing or WeChat reports the API is unavailable, you are outside WeChat or the server has no AppID/AppSecret: the native file picker is used instead and works the same way.
+
+**The status bar says "checking" forever.** The probe times out after 8 seconds and then shows "could not confirm". Use **Re-check** to run it again; preview and printing are never blocked.
+
+**Did the preview change my text?** No. Layout values apply to that one job. **Back to editing** leaves your original content untouched, and **Print** is the only thing that produces paper.
+
+**I want to skip the preview.** Set `REQUIRE_PREVIEW = False` at the top of `print_server.py` to restore direct printing. The default stays `True`.
+
 **File preview fails / Office cannot open.** Make sure the file opens in Word/Excel/PowerPoint on the PC. Without Microsoft Office, save it as PDF first. PDF/TXT/HTML/images do not need Office.
 
-**Where are WeChat chat files?** After tapping the file input, look for the "Chat files" / "Files" entry in the phone picker. If the current WeChat version does not show it, save the file to the phone first.
+**Where are WeChat chat files?** Inside WeChat, use **Pick from WeChat chat** to open the conversation file list directly. If the button is missing or WeChat reports the API is unavailable, you are outside WeChat or the server has no AppID/AppSecret: the native file picker is used instead and works the same way.
 
-**Why does preview show only 3 pages?** To keep the phone UI fast and prevent accidental long prints. The title shows the total page count; confirming prints all pages.
+**Why does the preview page show only a few pages?** To keep the phone fast. It returns at most 9 pages and the header shows the total; **Print** still outputs every page.
 
 **Why no "print completed" message?** Windows spooler accepts a job before paper comes out. The UI only promises "queued" or "failed", not a fake completion event.
 
@@ -367,6 +508,17 @@ python print_server.py
 ```
 
 CI runs `py_compile` on a Windows runner. It does not print, because GitHub Actions has no printer.
+
+Manual checklist:
+
+1. Print one page from Notepad so the Windows printing path is known-good.
+2. Start the server and check the printer status bar at the top of the print page.
+3. Submit short text: the preview page must open, showing A4 / 24 pt / 20 mm and the right page count.
+4. Push every control to its limit (A5, landscape, 0 mm margins, 200 % scale, 72 pt, 3.0 line spacing) and confirm the page count follows.
+5. Reset all: values return to defaults and the page count matches step 3.
+6. Back to editing: the original text is unchanged; re-entering the preview keeps your last layout.
+7. `curl -X POST /print/text` directly: expect **403**, not a printed page.
+8. Repeat the two QR regression checks before shipping a print-logic change.
 
 ## Contributing
 

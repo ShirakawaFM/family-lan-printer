@@ -36,6 +36,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -87,6 +89,10 @@ MAX_IMAGE_PIXELS = 50_000_000
 # 文字长度上限，防止一次误粘贴把打印机打空。20000 字约几十页。
 MAX_TEXT_CHARS = 20000
 
+# 文件等待确认打印的保留时间（秒）；超过时间自动清理。
+FILE_TTL_SECONDS = 1800
+MAX_PREPARED_FILES = 20
+
 # 手机文件 / 聊天记录文件上传。
 # 支持 PDF、Word、Excel、PPT、TXT、HTML、图片；Office 文件会调用本机 Office 转 PDF。
 FILE_MAX_BYTES = 50 * 1024 * 1024
@@ -96,6 +102,68 @@ PDF_PRINT_DPI = 200
 MAX_FILE_TEXT_CHARS = 50000
 FILE_TTL_SECONDS = 1800
 MAX_PREPARED_FILES = 20
+
+# =============================================================================
+# 一-B、打印前预览（强制流程）+ 微信聊天文件直选 + 启动打印机自检
+# =============================================================================
+
+# 【是否强制先预览】True 表示所有打印都必须先经过预览页，
+# 绕过预览直接调用旧打印接口会被拒绝；改成 False 可恢复旧行为（保留给排障用）。
+REQUIRE_PREVIEW = True
+
+# 预览会话有效期（秒）。期间可以反复调整参数；超时自动清理临时文件。
+PREVIEW_TTL_SECONDS = 1800
+# 同时保留的预览会话数量上限，防止长时间不打印堆积临时文件。
+MAX_PREVIEW_SESSIONS = 20
+# 预览渲染分辨率。只影响预览图清晰度，不影响分页位置、换行与裁切结果。
+PREVIEW_DPI = 96
+# 单次预览最多返回多少页图片（总页数始终返回精确值）。
+PREVIEW_MAX_RETURN_PAGES = 9
+# 单次预览最多渲染多少页，避免超长文本把服务拖住。
+PREVIEW_MAX_RENDER_PAGES = 40
+# 预览缩略图长边上限（像素）。
+PREVIEW_THUMB_EDGE = 760
+
+# PDF / Office 转换结果是否套用统一版面（纸张、方向、页边距、缩放）。
+# True = 与文字、图片一致，预览页里调整的参数对 PDF 同样生效（推荐）；
+# False = 保留改造前的行为，PDF 整页交给打印机适配可打印区。
+PDF_USE_LAYOUT_PAGE = True
+
+# 纸张规格（毫米）。预览页下拉框与服务端校验共用同一份定义。
+PAGE_SIZES_MM = {
+    "A4": (210.0, 297.0),
+    "A5": (148.0, 210.0),
+    "B5": (176.0, 250.0),
+    "Letter": (215.9, 279.4),
+    "Legal": (215.9, 355.6),
+}
+DEFAULT_PAGE_SIZE = "A4"
+# portrait=纵向 / landscape=横向
+DEFAULT_ORIENTATION = "portrait"
+DEFAULT_SCALE_PERCENT = 100.0
+
+# 排版参数的合法区间。服务端与预览页共用，超出区间的请求一律夹取到边界。
+LAYOUT_LIMITS = {
+    "margin_mm": (0.0, 60.0),
+    "scale_percent": (25.0, 200.0),
+    "font_size_pt": (6.0, 72.0),
+    "line_spacing": (0.8, 3.0),
+}
+ORIENTATIONS = ("portrait", "landscape")
+
+# 启动时打印机自检（始终后台异步执行，不阻塞网页服务）。
+PRINTER_PROBE_ENABLED = True
+PRINTER_PROBE_TIMEOUT = 8.0
+
+# 【微信聊天文件直选（可选能力，默认关闭）】
+# 打开后，网页会尝试用微信 JS-SDK 的 chooseMessageFile 直接从聊天会话里选文件。
+# 该能力要求：网页必须在微信内置浏览器中打开、域名已备案并配置为公众号JS安全域名、
+# 且走 HTTPS。家庭内网 http://192.168.x.x:5000 这种地址无法通过这些校验，
+# 因此默认关闭，直接走“原生文件选择器”降级路径（同样能选到聊天里的文件）。
+# 只有在用备案域名 + HTTPS 反代访问时，才建议打开并填写下面两项。
+WECHAT_JSAPI_ENABLED = False
+WECHAT_APPID = ""
+WECHAT_APPSECRET = ""
 
 # 打印任务结束后，临时文件保留多少秒再删除。
 DELETE_AFTER_SECONDS = 30
@@ -328,6 +396,243 @@ def _page_size_px(dpi: int) -> tuple[int, int]:
 
 
 # =============================================================================
+# 三-B、版面参数（LayoutSpec）：预览页编辑器与打印输出共用同一套定义
+# =============================================================================
+#
+# 设计要点：
+#   1) 所有版面计算都在“毫米 / 磅（pt）”空间完成，最后一步才乘 dpi 换成像素；
+#      因此 96dpi 的预览和 300dpi 的打印，分页位置、换行位置、裁切范围完全一致。
+#   2) LayoutSpec 的默认值就是本文件顶部的那几个常量（A4、20mm、24pt、1.5 倍行距、
+#      100% 缩放、纵向），所以不传 layout 时渲染结果与改造前逐像素相同。
+#   3) 服务端会对每一项做区间校验与“四边边距不能吃掉整张纸”的保护，
+#      预览页拿到的永远是一个合法版面，不会渲染出负尺寸画布。
+
+PT_PER_MM = 72.0 / 25.4
+
+
+def _mm_to_pt(mm: float) -> float:
+    return mm * PT_PER_MM
+
+
+def _px_from_pt(pt: float, dpi: int) -> int:
+    return int(round(pt * dpi / 72.0))
+
+
+def _font_px(size_pt: float, dpi: int) -> int:
+    return max(1, int(round(size_pt * dpi / 72.0)))
+
+
+@dataclass(frozen=True)
+class LayoutSpec:
+    """一次打印的完整版面参数。字段默认值 = 顶部“用户配置区”的常量。"""
+
+    page_size: str = DEFAULT_PAGE_SIZE
+    orientation: str = DEFAULT_ORIENTATION
+    margin_top_mm: float = PAGE_MARGIN_MM
+    margin_right_mm: float = PAGE_MARGIN_MM
+    margin_bottom_mm: float = PAGE_MARGIN_MM
+    margin_left_mm: float = PAGE_MARGIN_MM
+    scale_percent: float = DEFAULT_SCALE_PERCENT
+    font_size_pt: float = TEXT_FONT_SIZE_PT
+    line_spacing: float = TEXT_LINE_SPACING
+
+    def effective_font_pt(self) -> float:
+        """叠加缩放后的实际正文字号（磅）。"""
+        return float(self.font_size_pt) * float(self.scale_percent) / 100.0
+
+    def to_dict(self) -> dict:
+        return {
+            "page_size": self.page_size,
+            "orientation": self.orientation,
+            "margin_top_mm": round(self.margin_top_mm, 2),
+            "margin_right_mm": round(self.margin_right_mm, 2),
+            "margin_bottom_mm": round(self.margin_bottom_mm, 2),
+            "margin_left_mm": round(self.margin_left_mm, 2),
+            "scale_percent": round(self.scale_percent, 1),
+            "font_size_pt": round(self.font_size_pt, 1),
+            "line_spacing": round(self.line_spacing, 2),
+        }
+
+
+DEFAULT_LAYOUT = LayoutSpec()
+
+
+def _clamp_number(value, low: float, high: float, default: float) -> float:
+    """把一个可能是字符串/None/NaN 的输入安全地夹到合法区间。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if result != result or result in (float("inf"), float("-inf")):
+        return float(default)
+    return max(float(low), min(float(high), result))
+
+
+def _fit_margins(
+    page_width_mm: float, page_height_mm: float,
+    top: float, right: float, bottom: float, left: float,
+) -> tuple[float, float, float, float]:
+    """四边边距吃掉整张纸时按比例压缩，保证至少留下 10mm 的可写区域。"""
+    max_vertical = max(10.0, page_height_mm - 10.0)
+    max_horizontal = max(10.0, page_width_mm - 10.0)
+
+    vertical = top + bottom
+    if vertical > max_vertical and vertical > 0:
+        ratio = max_vertical / vertical
+        top, bottom = top * ratio, bottom * ratio
+
+    horizontal = left + right
+    if horizontal > max_horizontal and horizontal > 0:
+        ratio = max_horizontal / horizontal
+        left, right = left * ratio, right * ratio
+    return top, right, bottom, left
+
+
+def page_size_mm(spec: LayoutSpec) -> tuple[float, float]:
+    """按纸张 + 方向返回实际纸面宽高（毫米）。"""
+    width, height = PAGE_SIZES_MM.get(
+        spec.page_size, PAGE_SIZES_MM[DEFAULT_PAGE_SIZE]
+    )
+    if spec.orientation == "landscape":
+        return height, width
+    return width, height
+
+
+def normalize_layout(raw) -> LayoutSpec:
+    """
+    把外部传入的任意 dict 规范化成合法 LayoutSpec。
+
+    任何缺失、非法、越界的字段都会被替换为默认值或夹到边界，
+    因此不可能构造出负尺寸画布 / 除零 / NaN 的渲染参数。
+    """
+    if not isinstance(raw, dict):
+        return DEFAULT_LAYOUT
+
+    page_size = str(raw.get("page_size") or DEFAULT_PAGE_SIZE)
+    if page_size not in PAGE_SIZES_MM:
+        page_size = DEFAULT_PAGE_SIZE
+
+    orientation = str(raw.get("orientation") or DEFAULT_ORIENTATION).lower()
+    if orientation not in ORIENTATIONS:
+        orientation = DEFAULT_ORIENTATION
+
+    low, high = LAYOUT_LIMITS["margin_mm"]
+
+    def margin(key: str) -> float:
+        return round(
+            _clamp_number(raw.get(key), low, high, PAGE_MARGIN_MM), 2
+        )
+
+    base_width, base_height = PAGE_SIZES_MM[page_size]
+    page_width, page_height = (
+        (base_height, base_width)
+        if orientation == "landscape"
+        else (base_width, base_height)
+    )
+    top, right, bottom, left = _fit_margins(
+        page_width, page_height,
+        margin("margin_top_mm"), margin("margin_right_mm"),
+        margin("margin_bottom_mm"), margin("margin_left_mm"),
+    )
+
+    scale_low, scale_high = LAYOUT_LIMITS["scale_percent"]
+    font_low, font_high = LAYOUT_LIMITS["font_size_pt"]
+    space_low, space_high = LAYOUT_LIMITS["line_spacing"]
+
+    return LayoutSpec(
+        page_size=page_size,
+        orientation=orientation,
+        margin_top_mm=top,
+        margin_right_mm=right,
+        margin_bottom_mm=bottom,
+        margin_left_mm=left,
+        scale_percent=round(
+            _clamp_number(
+                raw.get("scale_percent"), scale_low, scale_high,
+                DEFAULT_SCALE_PERCENT,
+            ), 1
+        ),
+        font_size_pt=round(
+            _clamp_number(
+                raw.get("font_size_pt"), font_low, font_high,
+                TEXT_FONT_SIZE_PT,
+            ), 1
+        ),
+        line_spacing=round(
+            _clamp_number(
+                raw.get("line_spacing"), space_low, space_high,
+                TEXT_LINE_SPACING,
+            ), 2
+        ),
+    )
+
+
+def layout_rects_pt(
+    spec: LayoutSpec,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    返回 (纸宽pt, 纸高pt, 左边距pt, 上边距pt, 可写宽pt, 可写高pt)。
+
+    仅用于“分页、每页行数”这类与 dpi 无关的几何判断。
+    """
+    page_width_mm, page_height_mm = page_size_mm(spec)
+    page_width_pt = _mm_to_pt(page_width_mm)
+    page_height_pt = _mm_to_pt(page_height_mm)
+    left_pt = _mm_to_pt(spec.margin_left_mm)
+    top_pt = _mm_to_pt(spec.margin_top_mm)
+    right_pt = _mm_to_pt(spec.margin_right_mm)
+    bottom_pt = _mm_to_pt(spec.margin_bottom_mm)
+
+    avail_width_pt = max(1.0, page_width_pt - left_pt - right_pt)
+    avail_height_pt = max(1.0, page_height_pt - top_pt - bottom_pt)
+    return (
+        page_width_pt, page_height_pt,
+        left_pt, top_pt, avail_width_pt, avail_height_pt,
+    )
+
+
+@dataclass(frozen=True)
+class LayoutPx:
+    """某个 dpi 下的整数像素版面：纸面尺寸、四边边距、可写区。"""
+
+    page_width: int
+    page_height: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+    avail_width: int
+    avail_height: int
+
+
+def layout_px(spec: LayoutSpec, dpi: int) -> LayoutPx:
+    """
+    把版面换算成某个 dpi 下的整数像素。
+
+    毫米 → 像素先各自取整再做减法，避免浮点传递带来的一像素漂移；
+    预览 (96dpi) 与打印 (300dpi) 走的是同一个函数。
+    """
+    dpi = max(48, int(dpi))
+    page_width_mm, page_height_mm = page_size_mm(spec)
+    page_width = max(1, _px_from_mm(page_width_mm, dpi))
+    page_height = max(1, _px_from_mm(page_height_mm, dpi))
+    left = _px_from_mm(spec.margin_left_mm, dpi)
+    top = _px_from_mm(spec.margin_top_mm, dpi)
+    right = _px_from_mm(spec.margin_right_mm, dpi)
+    bottom = _px_from_mm(spec.margin_bottom_mm, dpi)
+    return LayoutPx(
+        page_width=page_width,
+        page_height=page_height,
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+        avail_width=max(1, page_width - left - right),
+        avail_height=max(1, page_height - top - bottom),
+    )
+
+
+# =============================================================================
 # 四、文字排版与 A4 页面渲染
 # =============================================================================
 
@@ -337,7 +642,7 @@ _TOKEN_RE = re.compile(
 )
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=32)
 def _load_text_font(size_px: int) -> ImageFont.FreeTypeFont:
     """加载宋体；个别精简版 Windows 没有宋体时，自动改用其他中文字体。"""
     windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
@@ -424,56 +729,113 @@ def _wrap_paragraph(
     return lines
 
 
-def _iter_text_page_images(
-    text: str, dpi: int = RENDER_DPI
-) -> Iterator[Image.Image]:
-    """
-    把文字排成一张张 A4 白底黑字页面，逐页交给打印函数。
+# 文字换行/分页一律在这个参考分辨率下度量，保证“分页与 dpi 无关”：
+# 预览用 96dpi、打印用 300dpi，得到的行划分完全相同。
+_MEASURE_DPI = 300
 
-    注意：这个函数本身不是生成器（真正的 yield 在内层 generate 里），
-    所以字体加载、换行等准备工作会在 StartDoc 之前完成；准备工作失败
-    不会留下一个空打印作业。dpi 参数用于打印或手机预览。
-    """
-    dpi = max(48, int(dpi))
-    font_size_px = max(1, int(round(TEXT_FONT_SIZE_PT * dpi / 72.0)))
-    font = _load_text_font(font_size_px)
-    line_height = max(1, int(round(font_size_px * TEXT_LINE_SPACING)))
 
-    page_width, page_height = _page_size_px(dpi)
-    margin = _px_from_mm(PAGE_MARGIN_MM, dpi)
-    text_width = page_width - margin * 2
-    bottom_limit = page_height - margin
+def _layout_text_lines(text: str, spec: LayoutSpec) -> list[str]:
+    """
+    按版面可写宽度把整段文字折成行。
+
+    纯几何计算、与最终绘制 dpi 无关，所以这里的行数与换行位置，
+    在预览页和打印机里一定一模一样。
+    """
+    box = layout_px(spec, _MEASURE_DPI)
+    size_px = _font_px(spec.effective_font_pt(), _MEASURE_DPI)
+    font = _load_text_font(size_px)
+    max_width = box.avail_width
 
     normalized = (
         text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
     )
-    all_lines: list[str] = []
+    lines: list[str] = []
     for paragraph in normalized.split("\n"):
-        all_lines.extend(_wrap_paragraph(paragraph, font, text_width))
+        lines.extend(_wrap_paragraph(paragraph, font, max_width))
+    return lines
+
+
+def _paginate_lines(
+    lines: list[str], spec: LayoutSpec
+) -> list[list[str]]:
+    """
+    按版面可写高度把行分配到各页。
+
+    可容纳行数 = floor(可写高度 / 行高)，与 dpi 无关；
+    因此 96dpi 预览看到的分页结果，就是 300dpi 打印出来的分页结果。
+    """
+    _, _, _, _, _, avail_height_pt = layout_rects_pt(spec)
+    line_height_pt = spec.effective_font_pt() * float(spec.line_spacing)
+    if line_height_pt <= 0:
+        return [list(lines)]
+
+    per_page = int(avail_height_pt // line_height_pt)
+    if per_page < 1:
+        per_page = 1
+    if not lines:
+        return [[]]
+    return [
+        lines[index:index + per_page]
+        for index in range(0, len(lines), per_page)
+    ]
+
+
+def _has_printable_content(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    for line in lines:
+        if isinstance(line, str) and line.strip():
+            return True
+    return False
+
+
+def _draw_text_page(
+    page_lines: list[str], spec: LayoutSpec, dpi: int
+) -> Image.Image:
+    """把一页的行画到纸面上。位置由版面的整数像素几何决定，不做累加。"""
+    box = layout_px(spec, dpi)
+
+    size_px = _font_px(spec.effective_font_pt(), dpi)
+    font = _load_text_font(size_px)
+    line_height = max(1, _px_from_pt(
+        spec.effective_font_pt() * float(spec.line_spacing), dpi
+    ))
+
+    page = Image.new("RGB", (box.page_width, box.page_height), "white")
+    draw = ImageDraw.Draw(page)
+    for index, line in enumerate(page_lines):
+        if line:
+            draw.text(
+                (box.left, box.top + index * line_height),
+                line, font=font, fill=(0, 0, 0),
+            )
+    return page
+
+
+def _iter_text_page_images(
+    text: str, dpi: int = RENDER_DPI, layout: Optional[LayoutSpec] = None
+) -> Iterator[Image.Image]:
+    """
+    把文字排成一张张白底黑字页面，逐页交给打印函数。
+
+    注意：这个函数本身不是生成器（真正的 yield 在内层 generate 里），
+    所以字体加载、换行等准备工作会在 StartDoc 之前完成；准备工作失败
+    不会留下一个空打印作业。
+
+    dpi 决定输出清晰度，layout 决定版面；不传 layout 时等价于改造前的
+    固定 A4 / 20mm / 24pt / 1.5 倍行距排版。
+    """
+    spec = layout or DEFAULT_LAYOUT
+    dpi = max(48, int(dpi))
+    lines = _layout_text_lines(text, spec)
+    pages = _paginate_lines(lines, spec)
+    printable = _has_printable_content(lines)
 
     def generate() -> Iterator[Image.Image]:
-        page: Optional[Image.Image] = None
-        draw: Optional[ImageDraw.ImageDraw] = None
-        y = margin
-        has_content = False
-
-        for line in all_lines:
-            if page is None or y + line_height > bottom_limit:
-                if page is not None and has_content:
-                    yield page
-                page = Image.new("RGB", (page_width, page_height), "white")
-                draw = ImageDraw.Draw(page)
-                y = margin
-                has_content = False
-
-            if line:
-                # 左对齐、页边距固定，不提供任何排版选项。
-                draw.text((margin, y), line, font=font, fill=(0, 0, 0))
-                has_content = True
-            y += line_height
-
-        if page is not None and has_content:
-            yield page
+        if not printable:
+            return
+        for page_lines in pages:
+            yield _draw_text_page(page_lines, spec, dpi)
 
     return generate()
 
@@ -495,27 +857,49 @@ def _flatten_to_rgb(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def _render_image_page(image_path: Path, dpi: int = RENDER_DPI) -> Image.Image:
-    """图片等比例缩放，完整放进 A4 页边距内并居中，不拉伸、不裁切。"""
+def _place_image_on_page(
+    image: Image.Image, spec: LayoutSpec, dpi: int
+) -> Image.Image:
+    """
+    把一张图按版面放到纸面上：等比缩放（不拉伸），在可写区居中。
+
+    scale_percent > 100 时目标框超出可写区，超出部分会被自然裁切；
+    预览与实际打印走的是同一个函数，所以“裁到哪儿”两边完全一致。
+    """
+    dpi = max(48, int(dpi))
+    box = layout_px(spec, dpi)
+
+    ratio = float(spec.scale_percent) / 100.0
+    target_width = max(1, int(round(box.avail_width * ratio)))
+    target_height = max(1, int(round(box.avail_height * ratio)))
+
+    fitted = ImageOps.contain(
+        image, (target_width, target_height), Image.Resampling.LANCZOS
+    )
+    canvas = Image.new("RGB", (box.page_width, box.page_height), "white")
+    x = box.left + (box.avail_width - fitted.width) // 2
+    y = box.top + (box.avail_height - fitted.height) // 2
+    canvas.paste(fitted, (x, y))
+    return canvas
+
+
+def _render_image_page(
+    image_path: Path,
+    dpi: int = RENDER_DPI,
+    layout: Optional[LayoutSpec] = None,
+) -> Image.Image:
+    """
+    图片等比缩放后放进版面内并居中，不拉伸。
+
+    不传 layout 时等价于改造前的 A4 + 固定页边距行为。
+    """
+    spec = layout or DEFAULT_LAYOUT
     with Image.open(image_path) as source:
         source = ImageOps.exif_transpose(source)  # 手机照片方向自动摆正
         source.load()
         image = _flatten_to_rgb(source)
 
-    dpi = max(48, int(dpi))
-    page_width, page_height = _page_size_px(dpi)
-    margin = _px_from_mm(PAGE_MARGIN_MM, dpi)
-    max_width = page_width - margin * 2
-    max_height = page_height - margin * 2
-
-    fitted = ImageOps.contain(
-        image, (max_width, max_height), Image.Resampling.LANCZOS
-    )
-    canvas = Image.new("RGB", (page_width, page_height), "white")
-    x = (page_width - fitted.width) // 2
-    y = (page_height - fitted.height) // 2
-    canvas.paste(fitted, (x, y))
-    return canvas
+    return _place_image_on_page(image, spec, dpi)
 
 
 # =============================================================================
@@ -597,9 +981,11 @@ def _read_text_file(path: Path) -> str:
     raise UserFacingError("这个文字文件编码无法识别，请另存为 UTF-8 后再试")
 
 
-def _to_preview_data_uri(image: Image.Image) -> str:
+def _to_preview_data_uri(
+    image: Image.Image, edge: int = 720
+) -> str:
     preview = image.convert("RGB")
-    preview.thumbnail((720, 1020), Image.Resampling.LANCZOS)
+    preview.thumbnail((edge, edge * 4 // 3), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
     preview.save(buffer, format="JPEG", quality=82, optimize=True)
     return (
@@ -650,29 +1036,53 @@ def _pdf_preview(pdf_path: Path):
         pdf.close()
 
 
-def _iter_pdf_page_images(pdf_path: Path) -> Iterator[Image.Image]:
+def _iter_pdf_page_images(
+    pdf_path: Path,
+    dpi: int = PDF_PRINT_DPI,
+    layout: Optional[LayoutSpec] = None,
+) -> Iterator[Image.Image]:
+    """
+    逐页渲染 PDF 并按版面放到纸面上。
+
+    PDF_USE_LAYOUT_PAGE 为 True（默认）时，PDF 会和文字/图片一样遵守
+    预览页里的纸张、方向、页边距与缩放，做到“预览即所得”；
+    设为 False 则恢复改造前的行为：整页直接交给打印机适配可打印区。
+    """
+    spec = layout or DEFAULT_LAYOUT
+    dpi = max(48, int(dpi))
     pdfium = _lazy_import("pdfium")
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
         if len(pdf) <= 0:
             raise RuntimeError("这个 PDF 没有可打印的页面")
         for index in range(len(pdf)):
-            yield _render_pdf_page(pdf, index, PDF_PRINT_DPI)
+            rendered = _render_pdf_page(pdf, index, dpi)
+            if PDF_USE_LAYOUT_PAGE:
+                yield _place_image_on_page(rendered, spec, dpi)
+            else:
+                yield rendered
     finally:
         pdf.close()
 
 
-def _print_pdf_job(pdf_path: Path) -> None:
+def _print_pdf_job(
+    pdf_path: Path, layout: Optional[LayoutSpec] = None
+) -> None:
     _print_page_images(
-        _iter_pdf_page_images(pdf_path), "家庭打印-文件"
+        _iter_pdf_page_images(pdf_path, PDF_PRINT_DPI, layout),
+        "家庭打印-文件",
     )
 
 
-def _print_slide_job(slides_dir: Path) -> None:
+def _print_slide_job(
+    slides_dir: Path, layout: Optional[LayoutSpec] = None
+) -> None:
     slide_files = sorted(slides_dir.glob("slide_*.png"))
     if not slide_files:
         raise RuntimeError("没有可打印的幻灯片")
-    pages = (_render_image_page(path) for path in slide_files)
+    pages = (
+        _render_image_page(path, RENDER_DPI, layout) for path in slide_files
+    )
     _print_page_images(pages, "家庭打印-演示文稿")
 
 
@@ -1020,6 +1430,196 @@ def _take_prepared(file_id: str) -> Optional[PreparedFile]:
         return _prepared_files.pop(file_id, None)
 
 
+# =============================================================================
+# 五-C、预览会话：所有打印任务的唯一入口
+# =============================================================================
+#
+# 约定：
+#   1) 主页上的文字 / 图片 / 文件三个入口都只负责“创建预览会话”，
+#      真正的打印只能由预览页发起（POST /preview/<id>/print）。
+#   2) 预览会话保存的是内容快照 + 当前版面参数；调参数只改 session.layout，
+#      绝不改写原始内容，取消时可以选择连临时文件一起清理。
+#   3) 会话有 TTL，超时自动清理，避免长时间不打印堆积临时目录。
+
+@dataclass
+class PreviewSession:
+    preview_id: str
+    kind: str                    # text / image / pdf / images
+    name: str                    # 展示用的文件名或标题
+    source_path: Path            # 内容快照（txt / 图片 / PDF / 幻灯片目录）
+    work_dir: Path               # 本次预览占用的临时目录
+    layout: LayoutSpec = DEFAULT_LAYOUT
+    created_at: float = field(default_factory=time.time)
+    # False 表示这份内容仍然归“待打印文件列表”管，预览取消时不能删它的目录。
+    owns_work_dir: bool = True
+    # 内容来自哪条待打印文件记录（没有则为空字符串）。
+    source_ref: str = ""
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created_at > PREVIEW_TTL_SECONDS
+
+
+_preview_lock = threading.Lock()
+_preview_sessions: dict[str, PreviewSession] = {}
+
+
+def _new_work_dir(prefix: str) -> Path:
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    return TEMP_DIR / (prefix + uuid.uuid4().hex)
+
+
+def _schedule_preview_cleanup(preview_id: str) -> None:
+    def cleanup() -> None:
+        with _preview_lock:
+            session = _preview_sessions.pop(preview_id, None)
+        if session is not None and session.owns_work_dir:
+            _delete_path(session.work_dir)
+            log.info("预览会话超时已清理：%s", session.name)
+
+    timer = threading.Timer(PREVIEW_TTL_SECONDS, cleanup)
+    timer.daemon = True
+    timer.start()
+
+
+def _store_preview(session: PreviewSession) -> None:
+    dropped: list[PreviewSession] = []
+    with _preview_lock:
+        _preview_sessions[session.preview_id] = session
+        while len(_preview_sessions) > MAX_PREVIEW_SESSIONS:
+            _, old = next(iter(_preview_sessions.items()))
+            _preview_sessions.pop(old.preview_id, None)
+            dropped.append(old)
+    for old in dropped:
+        if old.owns_work_dir:
+            _delete_path(old.work_dir)
+    _schedule_preview_cleanup(session.preview_id)
+
+
+def _get_preview(preview_id: Optional[str]) -> Optional[PreviewSession]:
+    """取一个仍然有效的预览会话；过期或不存在返回 None。"""
+    if not preview_id:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", str(preview_id)):
+        return None
+    with _preview_lock:
+        session = _preview_sessions.get(preview_id)
+    if session is None:
+        return None
+    if session.is_expired():
+        _drop_preview(preview_id)
+        return None
+    return session
+
+
+def _drop_preview(preview_id: str) -> Optional[PreviewSession]:
+    """取出并从表里移除（打印、取消、超时回收都走这里）。"""
+    with _preview_lock:
+        return _preview_sessions.pop(preview_id, None)
+
+
+def _preview_page_count(session: PreviewSession) -> int:
+    """不渲染全图地算出总页数，保证预览页显示的页码与打印结果一致。"""
+    try:
+        if session.kind == "text":
+            text = session.source_path.read_text(encoding="utf-8")
+            lines = _layout_text_lines(text, session.layout)
+            if not _has_printable_content(lines):
+                return 0
+            return len(_paginate_lines(lines, session.layout))
+        if session.kind == "pdf":
+            pdfium = _lazy_import("pdfium")
+            pdf = pdfium.PdfDocument(str(session.source_path))
+            try:
+                return len(pdf)
+            finally:
+                pdf.close()
+        if session.kind == "images":
+            return len(sorted(session.source_path.glob("slide_*.png")))
+        if session.kind == "image":
+            return 1
+    except Exception:
+        log.exception("计算预览页数失败")
+    return 0
+
+
+def _iter_preview_pages(
+    session: PreviewSession, dpi: int = PREVIEW_DPI
+) -> Iterator[Image.Image]:
+    """
+    按当前版面生成预览页。
+
+    与真实打印调用的是同一批渲染函数，只是 dpi 不同（预览用 96dpi 省流量）；
+    分页、换行、裁切由 layout 的毫米/磅几何决定，所以两边结果完全一致。
+    """
+    spec = session.layout
+    dpi = max(48, int(dpi))
+    if session.kind == "text":
+        text = session.source_path.read_text(encoding="utf-8")
+        yield from _iter_text_page_images(text, dpi, spec)
+    elif session.kind == "image":
+        yield _render_image_page(session.source_path, dpi, spec)
+    elif session.kind == "pdf":
+        yield from _iter_pdf_page_images(session.source_path, dpi, spec)
+    elif session.kind == "images":
+        for path in sorted(session.source_path.glob("slide_*.png")):
+            yield _render_image_page(path, dpi, spec)
+    else:
+        raise RuntimeError("未知的预览内容类型")
+
+
+def _create_text_preview(text: str) -> PreviewSession:
+    """给一段文字建立预览会话（内容写临时文件，之后不再依赖请求体）。"""
+    work_dir = _new_work_dir("text_")
+    work_dir.mkdir(parents=True, exist_ok=False)
+    content = work_dir / "content.txt"
+    content.write_text(text, encoding="utf-8")
+    return PreviewSession(
+        preview_id=uuid.uuid4().hex,
+        kind="text",
+        name="文字内容",
+        source_path=content,
+        work_dir=work_dir,
+    )
+
+
+def _session_from_prepared(record: PreparedFile, owns: bool) -> PreviewSession:
+    """把待打印文件转成预览会话。"""
+    return PreviewSession(
+        preview_id=uuid.uuid4().hex,
+        kind=record.kind,
+        name=record.name,
+        source_path=record.print_path,
+        work_dir=record.work_dir,
+        owns_work_dir=owns,
+        source_ref=record.file_id,
+    )
+
+
+def _enqueue_preview_print(
+    session: PreviewSession, cleanup_work_dir: bool
+) -> str:
+    """
+    把预览会话提交到打印队列。这是全项目唯一的“内容入队打印”通道。
+    返回 task_id，状态轮询沿用原来的 /status/<task_id> 协议。
+    """
+    task_id = uuid.uuid4().hex
+    _set_task_status(task_id, "queued")
+    PRINT_QUEUE.put(
+        PrintJob(
+            task_id=task_id,
+            kind=session.kind,
+            file_path=session.source_path,
+            cleanup_paths=(session.work_dir,) if cleanup_work_dir else (),
+            layout=session.layout,
+        )
+    )
+    log.info(
+        "预览确认打印 %s：%s，%s 页", task_id[:8], session.name,
+        _preview_page_count(session),
+    )
+    return task_id
+
+
 
 # =============================================================================
 # 六、Windows 默认打印机调用
@@ -1100,6 +1700,131 @@ def _get_ready_printer() -> str:
     return printer_name
 
 
+# -----------------------------------------------------------------------------
+# 启动自检：异步检测默认打印机，结果供控制台与网页的状态提示使用
+# -----------------------------------------------------------------------------
+
+# 每种异常给一句人话说明 + 一个明确的处理入口。
+_PRINTER_HINTS = {
+    "no_printer": (
+        "这台电脑还没有设置默认打印机",
+        "打开 设置 → 蓝牙和其他设备 → 打印机和扫描仪，把家里的打印机设为默认",
+    ),
+    "offline": (
+        "打印机处于离线状态",
+        "确认打印机已开机并连好，再在打印机窗口里取消“脱机使用打印机”",
+    ),
+    "paper_out": ("打印机缺纸", "给纸盒加纸后点“重新检测”"),
+    "paper_jam": ("打印机卡纸", "打开机盖取出卡纸后点“重新检测”"),
+    "door_open": ("打印机盖未关好", "关紧机盖和纸盒后点“重新检测”"),
+    "no_toner": ("打印机缺墨或墨粉", "更换墨盒/硒鼓后点“重新检测”"),
+    "paused": ("打印机已被暂停", "在打印队列窗口点“打印机 → 取消暂停”"),
+    "printer_error": ("打印机报错", "重启打印机后点“重新检测”"),
+    "paper_problem": ("打印机纸张故障", "检查纸张是否放好"),
+    "output_full": ("打印机出纸口已满", "取走出纸口的纸后重试"),
+    "not_available": ("打印机当前不可用", "检查打印机电源与连接"),
+    "server_offline": ("打印服务器离线", "确认共享这台打印机的电脑已开机"),
+    "page_punt": ("打印机无法打印当前页", "减少每页内容或改用 PDF 后重试"),
+    "user_intervention": (
+        "打印机需要人工处理", "查看打印机屏幕或指示灯上的提示"
+    ),
+    "out_of_memory": ("打印机内存不足", "减少一次打印的页数后重试"),
+    "pending_deletion": ("打印队列里有异常任务", "清空打印队列后重试"),
+    "probe_failed": (
+        "没能读到打印机状态", "确认 Windows 的 Print Spooler 服务已启动"
+    ),
+}
+
+_PRINTER_STATE_LOCK = threading.Lock()
+_PRINTER_PROBE_LOCK = threading.Lock()
+_PRINTER_PROBING = False
+_PRINTER_STATE: dict = {
+    "state": "unknown",     # unknown / checking / ok / error
+    "code": "",
+    "name": None,
+    "message": "还没有检测打印机",
+    "hint": "",
+    "settings_uri": "ms-settings:printers",
+    "checked_at": 0.0,
+}
+
+
+def _printer_snapshot() -> dict:
+    with _PRINTER_STATE_LOCK:
+        return dict(_PRINTER_STATE)
+
+
+def _set_printer_state(state: str, code: str = "", name=None) -> dict:
+    message, hint = _PRINTER_HINTS.get(
+        code, ("运行正常，可以直接打印", "") if state == "ok" else ("打印机状态未知", "")
+    )
+    if state == "ok":
+        message = "默认打印机已就绪：" + str(name)
+    snapshot = {
+        "state": state,
+        "code": code,
+        "name": name,
+        "message": message,
+        "hint": hint,
+        "settings_uri": "ms-settings:printers",
+        "checked_at": time.time(),
+    }
+    with _PRINTER_STATE_LOCK:
+        _PRINTER_STATE.update(snapshot)
+    return snapshot
+
+
+def _probe_printer_once() -> dict:
+    """
+    同步检测一次默认打印机（几十~几百毫秒）。
+
+    只会读取状态、不会提交任何打印作业，因此可以随时重跑；
+    不要在启动主线程里调用，避免打印机服务卡顿时拖慢“可以扫码”的时间。
+    """
+    if PRINTER_PROBE_ENABLED is False:
+        return _set_printer_state("unknown", "", None)
+    try:
+        name = _get_default_printer()
+    except Exception:
+        log.exception("启动时检测默认打印机失败")
+        return _set_printer_state("error", "probe_failed", None)
+    if not name:
+        return _set_printer_state("error", "no_printer", None)
+    problem = _printer_status_problem(name)
+    if problem:
+        code, _text = problem
+        return _set_printer_state("error", code, name)
+    return _set_printer_state("ok", "", name)
+
+
+def _refresh_printer_state_async() -> bool:
+    """
+    在后台线程里重探一次打印机状态。
+
+    返回 False 表示已经有一轮检测在跑（不会并发，也不会阻塞当前线程）。
+    """
+    global _PRINTER_PROBING
+
+    def job() -> None:
+        global _PRINTER_PROBING
+        try:
+            _probe_printer_once()
+        finally:
+            with _PRINTER_PROBE_LOCK:
+                _PRINTER_PROBING = False
+
+    with _PRINTER_PROBE_LOCK:
+        if _PRINTER_PROBING:
+            return False
+        _PRINTER_PROBING = True
+
+    with _PRINTER_STATE_LOCK:
+        _PRINTER_STATE["state"] = "checking"
+        _PRINTER_STATE["message"] = "正在检测打印机…"
+    threading.Thread(target=job, name="printer-probe", daemon=True).start()
+    return True
+
+
 def _print_page_images(images: Iterable[Image.Image], job_name: str) -> None:
     """
     串行打印一组 A4 页面。
@@ -1170,15 +1895,21 @@ def _print_page_images(images: Iterable[Image.Image], job_name: str) -> None:
             pass
 
 
-def _print_text_job(txt_path: Path) -> None:
-    """从临时 txt 读取文字，排版后调用默认打印机。"""
+def _print_text_job(
+    txt_path: Path, layout: Optional[LayoutSpec] = None
+) -> None:
+    """从临时 txt 读取文字，按预览确认的版面排版后调用默认打印机。"""
     text = txt_path.read_text(encoding="utf-8")
-    _print_page_images(_iter_text_page_images(text), "家庭打印-文字")
+    _print_page_images(
+        _iter_text_page_images(text, RENDER_DPI, layout), "家庭打印-文字"
+    )
 
 
-def _print_image_job(image_path: Path) -> None:
-    """把上传图片排版到 A4 后调用默认打印机。"""
-    page = _render_image_page(image_path)
+def _print_image_job(
+    image_path: Path, layout: Optional[LayoutSpec] = None
+) -> None:
+    """把上传图片按预览确认的版面排版到纸面后调用默认打印机。"""
+    page = _render_image_page(image_path, RENDER_DPI, layout)
     _print_page_images(iter([page]), "家庭打印-图片")
 
 
@@ -1190,9 +1921,11 @@ def _print_image_job(image_path: Path) -> None:
 @dataclass
 class PrintJob:
     task_id: str
-    kind: str  # "text" / "image" / "pdf"
+    kind: str  # "text" / "image" / "pdf" / "images"
     file_path: Path
     cleanup_paths: tuple[Path, ...] = ()
+    # 预览确认过的版面参数；None 表示沿用默认固定排版（兼容旧调用方式）。
+    layout: Optional[LayoutSpec] = None
 
 
 PRINT_QUEUE: "queue.Queue[PrintJob]" = queue.Queue()
@@ -1244,14 +1977,15 @@ def _print_worker() -> None:
         try:
             _set_task_status(job.task_id, "printing")
             log.info("开始打印任务 %s（%s）", job.task_id[:8], job.kind)
+            layout = job.layout
             if job.kind == "text":
-                _print_text_job(job.file_path)
+                _print_text_job(job.file_path, layout)
             elif job.kind == "image":
-                _print_image_job(job.file_path)
+                _print_image_job(job.file_path, layout)
             elif job.kind == "pdf":
-                _print_pdf_job(job.file_path)
+                _print_pdf_job(job.file_path, layout)
             elif job.kind == "images":
-                _print_slide_job(job.file_path)
+                _print_slide_job(job.file_path, layout)
             else:
                 raise RuntimeError("未知的打印任务类型")
             _set_task_status(job.task_id, "done")
@@ -1293,6 +2027,68 @@ try:
     app.json.ensure_ascii = False
 except Exception:
     pass
+
+
+def _http_get_json(url: str, timeout: float = 3.5):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "family-lan-printer/1.1"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+# -----------------------------------------------------------------------------
+# 微信 JS-SDK：可选的“聊天会话直选文件”能力（默认关闭，失败一律降级）
+# -----------------------------------------------------------------------------
+
+_WECHAT_TOKEN_LOCK = threading.Lock()
+_WECHAT_TICKET = {"value": "", "expires_at": 0.0}
+
+
+def _wechat_jsapi_ticket() -> tuple[str, str]:
+    """
+    取一个还没过期的 jsapi_ticket（缓存 7200 秒）。
+
+    返回 ("", 原因) 表示取不到，调用方会走降级路径。
+    任何网络或凭据异常都只记日志，绝不影响打印主流程。
+    """
+    with _WECHAT_TOKEN_LOCK:
+        if _WECHAT_TICKET["value"] and time.time() < _WECHAT_TICKET["expires_at"]:
+            return _WECHAT_TICKET["value"], ""
+
+    try:
+        token_url = (
+            "https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential"
+            + "&appid=" + urllib.parse.quote(WECHAT_APPID)
+            + "&secret=" + urllib.parse.quote(WECHAT_APPSECRET)
+        )
+        token_data = _http_get_json(token_url)
+        access_token = str(token_data.get("access_token") or "")
+        if not access_token:
+            log.warning("取微信 access_token 失败：%s", token_data.get("errmsg"))
+            return "", "token_failed"
+    except Exception:
+        log.warning("取微信 access_token 异常（将走降级路径）", exc_info=True)
+        return "", "token_failed"
+
+    try:
+        ticket_url = (
+            "https://api.weixin.qq.com/cgi-bin/ticket/getticket"
+            + "?type=jsapi&access_token=" + urllib.parse.quote(access_token)
+        )
+        ticket_data = _http_get_json(ticket_url)
+        ticket = str(ticket_data.get("ticket") or "")
+        if not ticket:
+            log.warning("取微信 jsapi_ticket 失败：%s", ticket_data.get("errmsg"))
+            return "", "ticket_failed"
+    except Exception:
+        log.warning("取微信 jsapi_ticket 异常（将走降级路径）", exc_info=True)
+        return "", "ticket_failed"
+
+    with _WECHAT_TOKEN_LOCK:
+        _WECHAT_TICKET["value"] = ticket
+        _WECHAT_TICKET["expires_at"] = time.time() + 7000
+    return ticket, ""
 
 
 @lru_cache(maxsize=4)
@@ -1726,6 +2522,36 @@ img{display:block;max-width:100%}
 .brand b{display:block;font-size:16px;font-weight:800;letter-spacing:.01em;line-height:1.25}
 .brand small{display:block;font-size:11px;color:var(--faint);letter-spacing:.14em;text-transform:uppercase;line-height:1.3}
 .topbar-right{display:flex;align-items:center;gap:8px}
+
+/* 打印机状态条：启动自检结果 + 重试 / 处理入口 */
+.printer-bar{
+  display:flex;align-items:center;gap:10px;margin:12px 0 0;padding:10px 12px;
+  border-radius:var(--r-sm);border:1px solid var(--line);background:var(--surface-flat);
+}
+.printer-bar.is-ok{border-color:var(--ok-line);background:var(--ok-bg)}
+.printer-bar.is-bad{border-color:var(--bad-line);background:var(--bad-bg)}
+.printer-bar.is-idle{border-color:var(--warn-line);background:var(--warn-bg)}
+.printer-bar .pb-ico{width:26px;height:26px;flex:0 0 auto;display:grid;place-items:center;border-radius:9px;background:var(--surface-2)}
+.printer-bar.is-ok .pb-ico{background:var(--ok-bg);color:var(--ok)}
+.printer-bar.is-bad .pb-ico{background:var(--bad-bg);color:var(--bad)}
+.printer-bar.is-idle .pb-ico{background:var(--warn-bg);color:var(--warn)}
+.printer-bar .pb-ico svg{width:15px;height:15px}
+.printer-bar .pb-text{flex:1 1 auto;min-width:0}
+.printer-bar .pb-text b{display:block;font-size:13.5px;font-weight:700}
+.printer-bar .pb-text small{display:block;color:var(--muted);font-size:12px;line-height:1.5}
+.printer-bar .pb-act{display:flex;gap:6px;flex:0 0 auto}
+.pb-btn{
+  display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:0 10px;
+  border-radius:9px;border:1px solid var(--line-2);background:var(--surface-2);
+  font-size:12.5px;font-weight:700;color:var(--text);text-decoration:none;white-space:nowrap;
+}
+.pb-btn:active{transform:translateY(1px)}
+@media (max-width:560px){
+  .printer-bar{flex-wrap:wrap}
+  .printer-bar .pb-text{flex:1 1 100%;order:1}
+  .printer-bar .pb-ico{order:0}
+  .printer-bar .pb-act{order:2;flex:1 1 100%;justify-content:flex-end;margin-top:2px}
+}
 .pill{
   display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:99px;
   font-size:12px;font-weight:700;color:var(--muted);
@@ -2059,6 +2885,20 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
     </div>
   </header>
 
+  <div class="printer-bar" id="printerBar" hidden>
+    <span class="pb-ico" id="pbIcon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/></svg>
+    </span>
+    <span class="pb-text">
+      <b id="pbTitle">正在检测打印机…</b>
+      <small id="pbHint"></small>
+    </span>
+    <span class="pb-act">
+      <button class="pb-btn" id="pbRetry" type="button">重新检测</button>
+      <a class="pb-btn" id="pbSettings" href="ms-settings:printers">打印机设置</a>
+    </span>
+  </div>
+
   <div class="grid">
     <!-- 扫码卡 -->
     <aside class="card qr-card stagger d1">
@@ -2134,6 +2974,10 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
             <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></span>
             <input id="fileInput" type="file">
           </label>
+          <button class="btn btn-ghost" id="wechatPickButton" type="button" style="margin-top:10px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-4.3 7.3L16 21l-3.4-1.7a11 11 0 0 1-4.1.3l-1.6.5.5-1.5A8.4 8.4 0 0 1 8 4.5h.5"/><path d="M8 4.5a6.9 6.9 0 0 1 6.9 6.9"/></svg>
+            <span class="lbl">从微信聊天里直接选</span>
+          </button>
           <div class="picked" id="filePicked">
             <span class="thumb" style="display:grid;place-items:center;color:var(--muted)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span>
             <span class="nm" id="fileName"></span>
@@ -2143,7 +2987,7 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
           <div class="hint chips">
             <b>PDF</b><b>Word</b><b>Excel</b><b>PPT</b><b>TXT</b><b>HTML</b><b>图片</b>
           </div>
-          <p class="hint">微信里的文件，请在文件选择器中选「聊天文件」；如果没看到，先把文件保存到手机。</p>
+          <p class="hint">微信里的文件不用先保存：点上面的按钮（或在文件选择器里选「聊天文件」）直接读取。万一入口不可用，把文件转发到「文件传输助手」再选也能用。</p>
           <div class="bar" id="fileBar"><i></i></div>
           <button class="btn btn-ghost" id="previewFileButton" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></svg>
@@ -2154,7 +2998,7 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
             <div class="preview-pages" id="filePreviewPages"></div>
             <button class="btn btn-primary" id="confirmFileButton" type="button">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
-              <span class="lbl">确认打印这份文件</span>
+              <span class="lbl">预览这份文件</span>
             </button>
           </div>
         </div>
@@ -2515,6 +3359,9 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
 
   /* ---------------- 文字 ---------------- */
   var textInput = $("textInput"), textButton = $("textButton"), textCounter = $("textCounter");
+  var DRAFT_KEY = "fp-draft-text";
+  function goPreview(previewId) { window.location.href = "/preview/" + encodeURIComponent(previewId); }
+
   var MAX_TEXT = {{ max_text_chars }};
   function syncCounter() {
     if (!textCounter || !textInput) { return; }
@@ -2535,16 +3382,16 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
         return;
       }
       hideStatus();
-      busy(textButton, true, "正在提交…");
-      post("/print/text", JSON.stringify({ text: text }), { json: true }, function (res) {
+      busy(textButton, true, "正在生成预览…");
+      try { sessionStorage.setItem(DRAFT_KEY, text); } catch (e) {}
+      post("/preview/text", JSON.stringify({ text: text }), { json: true }, function (res) {
         busy(textButton, false);
-        if (res.ok) {
-          showStatus(true);
-          if (res.data.task_id) { poll(res.data.task_id); }
+        if (res.ok && res.data && res.data.preview_id) {
+          goPreview(res.data.preview_id);
         } else if (res.network) {
           toast("网络连接失败，请重试");
         } else {
-          showStatus(false);
+          toast((res.data && res.data.message) || "预览生成失败，请重试");
         }
       });
     });
@@ -2595,20 +3442,19 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
       if (file.size > MAX_IMAGE_BYTES) { toast("图片太大了，请换一张不超过 " + MAX_IMAGE_MB + "MB 的图片"); return; }
       var fd = new FormData();
       fd.append("image", file, file.name);
+      fd.append("layout", localStorage.getItem("fp-layout") || "");
       hideStatus();
-      busy(imageButton, true, "正在上传…");
+      busy(imageButton, true, "正在生成预览…");
       imageBar.show();
-      post("/print/image", fd, { bar: imageBar }, function (res) {
+      post("/preview/image", fd, { bar: imageBar }, function (res) {
         busy(imageButton, false);
         imageBar.hide();
-        if (res.ok) {
-          showStatus(true);
-          resetImage();
-          if (res.data.task_id) { poll(res.data.task_id); }
+        if (res.ok && res.data && res.data.preview_id) {
+          goPreview(res.data.preview_id);
         } else if (res.network) {
           toast("网络连接失败，请重试");
         } else {
-          showStatus(false);
+          toast((res.data && res.data.message) || "预览生成失败，请重试");
         }
       });
     });
@@ -2706,20 +3552,835 @@ textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--
   if (confirmFileButton) {
     confirmFileButton.addEventListener("click", function () {
       if (!currentFileId) { toast("请先选择文件并预览"); return; }
-      busy(confirmFileButton, true, "正在提交打印…");
-      post("/print/file/" + encodeURIComponent(currentFileId), null, {}, function (res) {
+      busy(confirmFileButton, true, "正在生成预览…");
+      var cf = new FormData();
+      cf.append("layout", localStorage.getItem("fp-layout") || "");
+      post("/preview/file/" + encodeURIComponent(currentFileId), cf, {}, function (res) {
         busy(confirmFileButton, false);
         if (res.network) { toast("网络连接失败，请重试"); return; }
-        if (res.ok) {
-          showStatus(true);
-          if (res.data.task_id) { poll(res.data.task_id); }
-          resetFile();
+        if (res.ok && res.data && res.data.preview_id) {
+          goPreview(res.data.preview_id);
         } else {
-          toast((res.data && res.data.message) || "文件提交失败，请重新选择");
+          toast((res.data && res.data.message) || "预览生成失败，请重试");
         }
       });
     });
   }
+
+  /* ---------------- 打印机状态（启动自检结果） ---------------- */
+  var pbBar = $("printerBar"), pbTitle = $("pbTitle"), pbHint = $("pbHint"), pbRetry = $("pbRetry");
+  function renderPrinter(data) {
+    var p = data && data.printer;
+    if (!p || !pbBar) { return; }
+    if (p.state === "unknown") { pbBar.hidden = true; return; }
+    pbBar.hidden = false;
+    pbBar.classList.remove("is-ok", "is-bad", "is-idle");
+    if (p.state === "checking") {
+      pbBar.classList.add("is-idle");
+      pbTitle.textContent = "正在检测打印机…";
+      pbHint.textContent = "";
+    } else if (p.state === "ok") {
+      pbBar.classList.add("is-ok");
+      pbTitle.textContent = p.message || "打印机已就绪";
+      pbHint.textContent = p.name || "";
+    } else {
+      pbBar.classList.add("is-bad");
+      pbTitle.textContent = p.message || "打印机异常";
+      pbHint.textContent = p.hint || "";
+    }
+  }
+  function loadPrinter() {
+    if (!pbBar) { return; }
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/status/printer", true);
+    xhr.onload = function () {
+      try { renderPrinter(JSON.parse(xhr.responseText)); } catch (e) {}
+    };
+    xhr.send(null);
+  }
+  if (pbRetry) {
+    pbRetry.addEventListener("click", function () {
+      pbBar.hidden = false;
+      pbBar.classList.remove("is-ok", "is-bad");
+      pbBar.classList.add("is-idle");
+      pbTitle.textContent = "正在重新检测…";
+      pbHint.textContent = "";
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", "/status/printer/refresh", true);
+      xhr.onload = function () { setTimeout(loadPrinter, 1500); };
+      xhr.onerror = function () {
+        pbTitle.textContent = "重新检测失败";
+        pbHint.textContent = "请检查电脑上的打印服务后重试。";
+      };
+      xhr.send(null);
+    });
+  }
+  loadPrinter();
+
+  /* ---------------- 微信聊天文件直选（失败自动降级） ---------------- */
+  function pickViaWeChat(fallback) {
+    var ua = navigator.userAgent || "";
+    if (!/MicroMessenger/i.test(ua)) { fallback(); return; }
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/wechat/jsconfig?url=" + encodeURIComponent(location.href.split("#")[0]), true);
+    xhr.onload = function () {
+      var cfg = {};
+      try { cfg = JSON.parse(xhr.responseText || "{}"); } catch (e) { cfg = {}; }
+      // 拿不到签名、或者根本不在可注入的环境里，一律走原生选择器。
+      if (!cfg.ok || !cfg.enabled || typeof wx === "undefined" || !wx.config) { fallback(); return; }
+      try {
+        wx.config({
+          debug: false, appId: cfg.appId, timestamp: cfg.timestamp,
+          nonceStr: cfg.nonceStr, signature: cfg.signature, jsApiList: cfg.jsApiList
+        });
+        wx.ready(function () {
+          wx.chooseMessageFile({
+            count: 1, type: "file",
+            success: function (res) {
+              var chosen = (res && res.tempFiles && res.tempFiles[0]) || null;
+              if (!chosen) { fallback(); return; }
+              uploadWeChatFile(chosen, fallback);
+            },
+            fail: function () { fallback(); }
+          });
+        });
+        wx.error(function () { fallback(); });
+      } catch (e) { fallback(); }
+    };
+    xhr.onerror = function () { fallback(); };
+    xhr.send(null);
+  }
+  function uploadWeChatFile(chosen, fallback) {
+    // JS-SDK 只给到聊天里的临时文件，需要再上传一次；任何失败都退回原生选择器。
+    busy(previewFileButton, true, "正在读取文件…");
+    try {
+      wx.uploadFile({
+        url: "/print/file", filePath: chosen.path, name: "file",
+        formData: { layout: localStorage.getItem("fp-layout") || "" },
+        success: function (res) {
+          busy(previewFileButton, false);
+          var data = {};
+          try { data = JSON.parse(res.data || "{}"); } catch (e) {}
+          if (!data.ok || !data.file_id) { fallback(); return; }
+          var cf = new FormData();
+          cf.append("layout", localStorage.getItem("fp-layout") || "");
+          post("/preview/file/" + encodeURIComponent(data.file_id), cf, {}, function (r2) {
+            if (r2.ok && r2.data && r2.data.preview_id) { goPreview(r2.data.preview_id); }
+            else { toast("文件读取失败，请用下面的按钮再选一次"); }
+          });
+        },
+        fail: function () { busy(previewFileButton, false); fallback(); }
+      });
+    } catch (e) { busy(previewFileButton, false); fallback(); }
+  }
+  var wxPick = $("wechatPickButton");
+  if (wxPick && fileInput) {
+    wxPick.addEventListener("click", function () {
+      toast("正在打开文件选择器…");
+      pickViaWeChat(function () { fileInput.click(); });
+    });
+  }
+
+  /* ---------------- 从预览页返回时恢复上次编辑的内容 ---------------- */
+  try {
+    var draft = sessionStorage.getItem(DRAFT_KEY);
+    if (draft && textInput && !textInput.value) {
+      textInput.value = draft;
+      syncCounter();
+    }
+  } catch (e) {}
+
+})();
+</script>
+</body>
+</html>
+"""
+
+
+PREVIEW_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#060911">
+<title>打印预览 · 家庭打印</title>
+<script>(function(){try{var t=localStorage.getItem("fp-theme");document.documentElement.setAttribute("data-theme",(t==="light"||t==="dark")?t:(window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<style>
+:root{
+  --bg:#060911;
+  --surface:linear-gradient(180deg,rgba(255,255,255,.062),rgba(255,255,255,.026));
+  --surface-flat:rgba(255,255,255,.04);
+  --surface-2:rgba(255,255,255,.055);
+  --line:rgba(255,255,255,.10);
+  --line-2:rgba(255,255,255,.16);
+  --text:#EAF0FA;
+  --muted:#98A5BA;
+  --faint:#6B7789;
+  --bg-blur:rgba(6,9,17,.72);
+  --accent:#6C8CFF;
+  --grad:linear-gradient(135deg,#5B7CFF 0%,#8B6DFF 55%,#B06CFF 100%);
+  --ok:#34D399; --ok-bg:rgba(52,211,153,.10); --ok-line:rgba(52,211,153,.34);
+  --bad:#FB7185; --bad-bg:rgba(251,113,133,.10); --bad-line:rgba(251,113,133,.34);
+  --warn:#FBBF24; --warn-bg:rgba(251,191,36,.10); --warn-line:rgba(251,191,36,.32);
+  --ring:rgba(108,140,255,.55);
+  --shadow:0 30px 70px -34px rgba(0,0,0,.95);
+  --shadow-sm:0 10px 26px -16px rgba(0,0,0,.9);
+  --r-lg:24px; --r-md:16px; --r-sm:12px;
+  --ease:cubic-bezier(.16,1,.3,1);
+  --spring:cubic-bezier(.22,1.2,.36,1);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#F3F5FA;
+  --surface:linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,255,255,.88));
+  --surface-flat:#FFFFFF;
+  --surface-2:rgba(15,23,42,.045);
+  --line:rgba(15,23,42,.10);
+  --line-2:rgba(15,23,42,.18);
+  --text:#0B1220;
+  --muted:#55617A;
+  --faint:#7C879B;
+  --bg-blur:rgba(243,245,250,.78);
+  --accent:#3D5CE5;
+  --grad:linear-gradient(135deg,#4361EE 0%,#6C4BE8 55%,#8B4BE8 100%);
+  --ok:#0F9D6B; --ok-bg:rgba(15,157,107,.09); --ok-line:rgba(15,157,107,.30);
+  --bad:#D93A52; --bad-bg:rgba(217,58,82,.08); --bad-line:rgba(217,58,82,.28);
+  --warn:#B45309; --warn-bg:rgba(180,83,9,.08); --warn-line:rgba(180,83,9,.28);
+  --ring:rgba(67,97,238,.40);
+  --shadow:0 30px 60px -34px rgba(15,23,42,.35);
+  --shadow-sm:0 10px 24px -16px rgba(15,23,42,.30);
+  color-scheme:light;
+}
+*,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+/* 让 hidden 属性始终生效（否则会被下面的 display:flex 覆盖） */
+[hidden]{display:none!important}
+html{background:var(--bg)}
+body{
+  margin:0;min-height:100dvh;background:var(--bg);color:var(--text);
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:16px;line-height:1.6;-webkit-text-size-adjust:100%;overflow-x:hidden;
+}
+h1,h2,h3,p,figure{margin:0}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+img{display:block;max-width:100%}
+::selection{background:rgba(108,140,255,.35)}
+
+.app{position:relative;z-index:1;max-width:1180px;margin:0 auto;padding:0 16px;padding-bottom:calc(28px + env(safe-area-inset-bottom))}
+.topbar{
+  position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;
+  padding:12px 0 12px;background:var(--bg-blur);
+  -webkit-backdrop-filter:saturate(160%) blur(14px);backdrop-filter:saturate(160%) blur(14px);
+  border-bottom:1px solid var(--line);
+}
+.topbar .title{flex:1 1 auto;min-width:0;text-align:center;font-size:15px;font-weight:700;letter-spacing:.02em}
+.topbar .title small{display:block;font-weight:500;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  min-height:44px;padding:0 16px;border-radius:var(--r-sm);
+  font-size:15px;font-weight:700;letter-spacing:.02em;
+  border:1px solid var(--line-2);background:var(--surface-flat);color:var(--text);
+  transition:transform .18s var(--ease),box-shadow .18s var(--ease),background .18s var(--ease);
+  white-space:nowrap;
+}
+.btn:active{transform:translateY(1px) scale(.99)}
+.btn-primary{
+  border:0;color:#fff;background:var(--grad);
+  box-shadow:0 12px 26px -14px rgba(108,140,255,.95),inset 0 1px 0 rgba(255,255,255,.28);
+}
+.btn-ghost:hover{background:var(--surface-2)}
+.btn[disabled]{opacity:.55;pointer-events:none}
+.btn-sm{min-height:34px;padding:0 11px;font-size:13px;font-weight:600;border-radius:10px}
+
+.grid{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:18px;margin-top:18px;align-items:start}
+@media (max-width:900px){.grid{grid-template-columns:minmax(0,1fr);gap:14px}}
+
+.card{
+  border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--surface);box-shadow:var(--shadow-sm);overflow:hidden;
+}
+.card-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.card-hd h2{font-size:15px;font-weight:800;letter-spacing:.02em}
+.card-bd{padding:14px 16px}
+
+.ctl{padding:12px 0;border-bottom:1px dashed var(--line)}
+.ctl:last-child{border-bottom:0}
+.ctl-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.ctl-name{font-size:14px;font-weight:700}
+.ctl-val{font-size:13px;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums}
+.ctl-reset{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:3px 8px;background:var(--surface-flat)}
+.ctl-reset:hover{color:var(--text);border-color:var(--line-2)}
+.ctl-row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.seg{display:flex;gap:6px}
+.seg button{
+  flex:1;min-height:38px;border-radius:10px;border:1px solid var(--line-2);
+  background:var(--surface-flat);font-size:13px;font-weight:700;color:var(--muted);
+}
+.seg button.on{background:var(--grad);color:#fff;border-color:transparent;box-shadow:0 8px 18px -12px rgba(108,140,255,.9)}
+select{
+  width:100%;min-height:42px;padding:0 10px;border-radius:10px;
+  border:1px solid var(--line-2);background:var(--surface-flat);color:var(--text);font:inherit;font-size:15px;
+}
+input[type=range]{
+  -webkit-appearance:none;appearance:none;width:100%;height:34px;background:transparent;margin:2px 0 0;
+}
+input[type=range]::-webkit-slider-runnable-track{height:5px;border-radius:99px;background:var(--surface-2)}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:22px;height:22px;margin-top:-9px;border-radius:50%;
+  background:var(--grad);box-shadow:0 0 0 4px var(--ring);border:0;cursor:pointer;
+}
+input[type=range]::-moz-range-track{height:5px;border-radius:99px;background:var(--surface-2)}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border:0;border-radius:50%;background:var(--accent);cursor:pointer}
+input[type=number]{
+  width:88px;min-height:38px;padding:0 10px;border-radius:10px;text-align:right;
+  border:1px solid var(--line-2);background:var(--surface-flat);color:var(--text);font:inherit;font-variant-numeric:tabular-nums;
+}
+.num-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 0}
+.num-row span{font-size:13px;color:var(--muted)}
+.hintline{font-size:12.5px;color:var(--muted);margin-top:4px}
+.reset-all{width:100%;margin-top:14px;min-height:44px}
+
+.preview-bd{padding:14px 16px 18px}
+.meta-line{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.meta-line .cnt{font-size:13px;color:var(--muted)}
+.meta-line .cnt b{color:var(--text);font-variant-numeric:tabular-nums}
+.pages{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.page{position:relative}
+.page figure{
+  position:relative;border:1px solid var(--line-2);border-radius:10px;overflow:hidden;
+  background:#fff;box-shadow:0 14px 30px -18px rgba(0,0,0,.75);
+}
+.page img{width:100%;height:auto;display:block}
+.page figcaption{position:absolute;left:8px;bottom:8px;padding:3px 8px;border-radius:99px;font-size:11px;font-weight:700;color:#0B1220;background:rgba(255,255,255,.86)}
+.skeleton{border-radius:10px;background:linear-gradient(100deg,var(--surface-2) 30%,var(--line) 45%,var(--surface-2) 62%);background-size:280% 100%;animation:shimmer 1.2s linear infinite}
+@keyframes shimmer{from{background-position:180% 0}to{background-position:-60% 0}}
+.busy-line{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-bottom:8px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 1s var(--ease) infinite}
+@keyframes pulse{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
+.empty-note{padding:26px 8px;text-align:center;color:var(--muted);font-size:14px}
+
+.note{margin-top:14px;padding:12px 14px;border-radius:var(--r-sm);font-size:14px;line-height:1.65}
+.note.ok{background:var(--ok-bg);border:1px solid var(--ok-line);color:var(--text)}
+.note.bad{background:var(--bad-bg);border:1px solid var(--bad-line);color:var(--text)}
+.note.warn{background:var(--warn-bg);border:1px solid var(--warn-line);color:var(--text)}
+.note b{display:block;margin-bottom:2px}
+.note .sub{color:var(--muted);font-size:13px}
+.note .actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
+
+#toasts{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
+.toast{padding:10px 16px;border-radius:99px;font-size:14px;font-weight:600;background:var(--bg-blur);border:1px solid var(--line-2);color:var(--text);box-shadow:var(--shadow-sm);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);animation:tIn .3s var(--ease)}
+@keyframes tIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media (max-width:520px){
+  .app{padding:0 12px}
+  .ctl-row-2{grid-template-columns:1fr}
+  .topbar .title{font-size:14px}
+  .btn{padding:0 12px}
+  .pages{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <button class="btn btn-ghost" id="btnBack" type="button">返回继续编辑</button>
+    <div class="title">
+      <span id="pvKind">打印预览</span>
+      <small id="pvName">加载中…</small>
+    </div>
+    <button class="btn btn-primary" id="btnPrint" type="button">打印</button>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <div class="card-hd">
+        <h2>排版调整</h2>
+        <span class="ctl-val" id="dirtyFlag" hidden>已调整</span>
+      </div>
+      <div class="card-bd">
+        <div class="ctl">
+          <div class="ctl-top"><span class="ctl-name">纸张尺寸</span></div>
+          <div style="margin-top:8px"><select id="pageSize" aria-label="纸张尺寸"></select></div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top"><span class="ctl-name">打印方向</span></div>
+          <div class="seg" style="margin-top:8px" role="group" aria-label="打印方向">
+            <button type="button" data-orientation="portrait" id="segPortrait">纵向</button>
+            <button type="button" data-orientation="landscape" id="segLandscape">横向</button>
+          </div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top">
+            <span class="ctl-name">页边距（毫米）</span>
+            <button class="ctl-reset" type="button" data-reset="margins">恢复默认</button>
+          </div>
+          <div class="num-row"><span>上</span><input type="number" id="mTop" step="1" min="0" max="60" inputmode="decimal"></div>
+          <div class="num-row"><span>下</span><input type="number" id="mBottom" step="1" min="0" max="60" inputmode="decimal"></div>
+          <div class="num-row"><span>左</span><input type="number" id="mLeft" step="1" min="0" max="60" inputmode="decimal"></div>
+          <div class="num-row"><span>右</span><input type="number" id="mRight" step="1" min="0" max="60" inputmode="decimal"></div>
+          <div class="hintline">边距过大时会自动留 10 毫米可写区域</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top">
+            <span class="ctl-name">缩放比例</span>
+            <span style="display:flex;align-items:center;gap:8px">
+              <span class="ctl-val" id="vScale">100%</span>
+              <button class="ctl-reset" type="button" data-reset="scale">默认</button>
+            </span>
+          </div>
+          <input type="range" id="scale" min="25" max="200" step="5" aria-label="缩放比例">
+          <div class="hintline">超过 100% 时超出可写区的部分会被裁掉，预览里看到的就是打印结果</div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top">
+            <span class="ctl-name">正文字号（磅）</span>
+            <span style="display:flex;align-items:center;gap:8px">
+              <span class="ctl-val" id="vFont">24</span>
+              <button class="ctl-reset" type="button" data-reset="font">默认</button>
+            </span>
+          </div>
+          <input type="range" id="fontSize" min="6" max="72" step="1" aria-label="正文字号">
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-top">
+            <span class="ctl-name">行距（倍）</span>
+            <span style="display:flex;align-items:center;gap:8px">
+              <span class="ctl-val" id="vLine">1.5</span>
+              <button class="ctl-reset" type="button" data-reset="line">默认</button>
+            </span>
+          </div>
+          <input type="range" id="lineSpacing" min="0.8" max="3" step="0.05" aria-label="行距">
+        </div>
+
+        <button class="btn btn-ghost reset-all" id="btnResetAll" type="button">全部恢复默认</button>
+        <div class="hintline" style="text-align:center">参数会自动记住，下次打开预览沿用</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-hd">
+        <h2>实际打印效果</h2>
+        <span class="ctl-val" id="printerPill" hidden></span>
+      </div>
+      <div class="preview-bd">
+        <div class="meta-line">
+          <span class="cnt">共 <b id="pageCount">–</b> 页<span id="shownWrap"> · 显示前 <b id="shown">–</b> 页</span></span>
+          <span class="busy-line" id="busyLine" hidden><i class="dot"></i>正在按新参数重新排版…</span>
+        </div>
+        <div id="statusBox" aria-live="polite"></div>
+        <div class="pages" id="pages"></div>
+      </div>
+    </section>
+  </div>
+  <p class="sr" id="srStatus" role="status" aria-live="polite"></p>
+</div>
+<div id="toasts"></div>
+
+<script>
+(function () {
+  "use strict";
+  var PREVIEW_ID = {{ preview_id_json|safe }};
+  var SERVER_LAYOUT = {{ layout_json|safe }};
+  var DEFAULTS = {{ defaults_json|safe }};
+  var KIND = {{ kind_json|safe }};
+  var MAX_RETURN = {{ max_return_pages }};
+  var LS_KEY = "fp-layout";
+
+  var REASON_TEXT = {
+    no_printer: ["没有设置默认打印机", "打开 设置 → 蓝牙和其他设备 → 打印机和扫描仪，把家里的打印机设为默认。"],
+    offline: ["打印机处于离线状态", "确认打印机已开机并连好，再取消“脱机使用打印机”。"],
+    paper_out: ["打印机缺纸", "给纸盒加纸后点“重新检测”。"],
+    paper_jam: ["打印机卡纸", "打开机盖取出卡纸后点“重新检测”。"],
+    door_open: ["打印机盖未关好", "关紧机盖和纸盒后重试。"],
+    no_toner: ["打印机缺墨或墨粉", "更换墨盒/硒鼓后重试。"],
+    paused: ["打印机已被暂停", "在打印队列窗口点“打印机 → 取消暂停”。"],
+    printer_error: ["打印机报错", "重启打印机后点“重新检测”。"],
+    paper_problem: ["打印机纸张故障", "检查纸张是否放好后重试。"],
+    output_full: ["打印机出纸口已满", "取走出纸口的纸后重试。"],
+    not_available: ["打印机当前不可用", "检查打印机电源与连接。"],
+    server_offline: ["打印服务器离线", "确认共享这台打印机的电脑已开机。"],
+    page_punt: ["打印机无法打印当前页", "减少每页内容或改用 PDF 后重试。"],
+    user_intervention: ["打印机需要人工处理", "查看打印机屏幕或指示灯提示。"],
+    out_of_memory: ["打印机内存不足", "减少一次打印的页数后重试。"],
+    pending_deletion: ["打印队列里有异常任务", "清空打印队列后重试。"],
+    probe_failed: ["没能读到打印机状态", "确认 Windows 的 Print Spooler 服务已启动。"],
+    printer_error_generic: ["打印失败", "检查打印机后回到预览页再打一次。"]
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  function toast(msg) {
+    var box = $("toasts");
+    var el = document.createElement("div");
+    el.className = "toast"; el.textContent = msg; box.appendChild(el);
+    setTimeout(function () { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, 2400);
+    setTimeout(function () { if (el.parentNode) { el.parentNode.removeChild(el); } }, 2800);
+  }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function num(v, def) { var n = parseFloat(v); return (isFinite(n) ? n : def); }
+  function sameJSON(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  // ---------------- 版面状态 ----------------
+  function normalize(raw) {
+    raw = raw || {};
+    var d = DEFAULTS;
+    function m(v) { return clamp(num(v, d.margin_top_mm), 0, 60); }
+    return {
+      page_size: String(raw.page_size || d.page_size),
+      orientation: (raw.orientation === "landscape") ? "landscape" : "portrait",
+      margin_top_mm: m(raw.margin_top_mm),
+      margin_right_mm: m(raw.margin_right_mm),
+      margin_bottom_mm: m(raw.margin_bottom_mm),
+      margin_left_mm: m(raw.margin_left_mm),
+      scale_percent: clamp(num(raw.scale_percent, d.scale_percent), 25, 200),
+      font_size_pt: clamp(num(raw.font_size_pt, d.font_size_pt), 6, 72),
+      line_spacing: clamp(num(raw.line_spacing, d.line_spacing), 0.8, 3)
+    };
+  }
+  var LAYOUT = SERVER_LAYOUT;
+  try {
+    var saved = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+    if (saved && typeof saved === "object") { LAYOUT = normalize(saved); }
+  } catch (e) { /* 忽略坏数据 */ }
+  var lastSent = LAYOUT;
+
+  function save() { try { localStorage.setItem(LS_KEY, JSON.stringify(LAYOUT)); } catch (e) {} }
+
+  // ---------------- 控件 ----------------
+  var PAGE_SIZES = {{ page_sizes_json|safe }};
+  var sel = $("pageSize");
+  PAGE_SIZES.forEach(function (name) {
+    var opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    sel.appendChild(opt);
+  });
+
+  function syncUI() {
+    sel.value = LAYOUT.page_size;
+    $("segPortrait").classList.toggle("on", LAYOUT.orientation === "portrait");
+    $("segLandscape").classList.toggle("on", LAYOUT.orientation === "landscape");
+    $("segPortrait").setAttribute("aria-pressed", LAYOUT.orientation === "portrait" ? "true" : "false");
+    $("segLandscape").setAttribute("aria-pressed", LAYOUT.orientation === "landscape" ? "true" : "false");
+    $("mTop").value = Math.round(LAYOUT.margin_top_mm);
+    $("mBottom").value = Math.round(LAYOUT.margin_bottom_mm);
+    $("mLeft").value = Math.round(LAYOUT.margin_left_mm);
+    $("mRight").value = Math.round(LAYOUT.margin_right_mm);
+    $("scale").value = LAYOUT.scale_percent;
+    $("fontSize").value = LAYOUT.font_size_pt;
+    $("lineSpacing").value = LAYOUT.line_spacing;
+    $("vScale").textContent = Math.round(LAYOUT.scale_percent) + "%";
+    $("vFont").textContent = Math.round(LAYOUT.font_size_pt);
+    $("vLine").textContent = (Math.round(LAYOUT.line_spacing * 100) / 100);
+    var changed = !sameJSON(LAYOUT, normalize(DEFAULTS));
+    $("dirtyFlag").hidden = !changed;
+    // 文件类内容按整页缩放，字号/行距由原文件决定，禁用对应控件避免误解。
+    var textOnly = (KIND === "text");
+    $("fontSize").disabled = !textOnly;
+    $("lineSpacing").disabled = !textOnly;
+  }
+
+  var timer = null;
+  function scheduleRender(immediate) {
+    save(); syncUI();
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (immediate) { render(); return; }
+    $("busyLine").hidden = false;
+    timer = setTimeout(function () { render(); }, 320);
+  }
+  function onCtl(el, key, cast) {
+    if (!el) { return; }
+    var handler = function () {
+      LAYOUT[key] = cast ? cast(el.value) : parseFloat(el.value);
+      LAYOUT = normalize(LAYOUT);
+      scheduleRender(key === "page_size" || key === "orientation");
+    };
+    el.addEventListener("input", handler);
+    el.addEventListener("change", handler);
+  }
+
+  sel.addEventListener("change", function () { LAYOUT.page_size = sel.value; scheduleRender(true); });
+  ["portrait", "landscape"].forEach(function (o) {
+    var btn = o === "portrait" ? $("segPortrait") : $("segLandscape");
+    btn.addEventListener("click", function () { LAYOUT.orientation = o; scheduleRender(true); });
+  });
+  onCtl($("mTop"), "margin_top_mm", parseFloat);
+  onCtl($("mBottom"), "margin_bottom_mm", parseFloat);
+  onCtl($("mLeft"), "margin_left_mm", parseFloat);
+  onCtl($("mRight"), "margin_right_mm", parseFloat);
+  onCtl($("scale"), "scale_percent", parseFloat);
+  onCtl($("fontSize"), "font_size_pt", parseFloat);
+  onCtl($("lineSpacing"), "line_spacing", parseFloat);
+
+  document.querySelectorAll("[data-reset]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var what = btn.getAttribute("data-reset");
+      if (what === "margins") {
+        LAYOUT.margin_top_mm = DEFAULTS.margin_top_mm;
+        LAYOUT.margin_right_mm = DEFAULTS.margin_right_mm;
+        LAYOUT.margin_bottom_mm = DEFAULTS.margin_bottom_mm;
+        LAYOUT.margin_left_mm = DEFAULTS.margin_left_mm;
+      } else if (what === "scale") { LAYOUT.scale_percent = DEFAULTS.scale_percent; }
+      else if (what === "font") { LAYOUT.font_size_pt = DEFAULTS.font_size_pt; }
+      else if (what === "line") { LAYOUT.line_spacing = DEFAULTS.line_spacing; }
+      LAYOUT = normalize(LAYOUT);
+      toast("已恢复默认值");
+      scheduleRender(true);
+    });
+  });
+  $("btnResetAll").addEventListener("click", function () {
+    LAYOUT = normalize(DEFAULTS);
+    toast("全部参数已恢复默认");
+    scheduleRender(true);
+  });
+
+  // ---------------- 渲染预览 ----------------
+  var seq = 0;
+  function skeleton(n) {
+    var box = $("pages"); box.innerHTML = "";
+    for (var i = 0; i < n; i++) {
+      var fig = document.createElement("figure");
+      fig.className = "skeleton";
+      fig.style.aspectRatio = "210 / 297";
+      box.appendChild(fig);
+    }
+  }
+  function post(url, body, cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      var data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { data = {}; }
+      cb(data, xhr.status);
+    };
+    xhr.onerror = function () { cb({ ok: false }, 0); };
+    xhr.send(body || "{}");
+  }
+
+  function render() {
+    var mine = ++seq;
+    post("/preview/" + PREVIEW_ID + "/render", JSON.stringify({ layout: LAYOUT }), function (data, status) {
+      if (mine !== seq) { return; }
+      $("busyLine").hidden = true;
+      if (status === 401 || (data && data.need_password)) {
+        location.href = "/"; return;
+      }
+      if (!data || !data.ok) {
+        if (data && data.expired) {
+          $("pages").innerHTML = "";
+          setNote("warn", "预览已过期", "请返回上一页重新选择内容再打印。", []);
+        } else {
+          toast((data && data.message) || "预览失败，请重试");
+        }
+        return;
+      }
+      LAYOUT = normalize(data.layout); save(); syncUI();
+      lastSent = LAYOUT;
+      $("pageCount").textContent = data.page_count;
+      var wrap = $("shownWrap");
+      wrap.style.display = (data.returned < data.page_count) ? "" : "none";
+      $("shown").textContent = data.returned;
+      var box = $("pages"); box.innerHTML = "";
+      if (!data.page_count) {
+        var empty = document.createElement("div");
+        empty.className = "empty-note";
+        empty.textContent = "这份内容目前没有可打印的页面，请调小字号或边距后重试。";
+        box.appendChild(empty);
+        return;
+      }
+      (data.pages || []).forEach(function (p) {
+        var wrapFig = document.createElement("div");
+        wrapFig.className = "page";
+        var fig = document.createElement("figure");
+        var img = document.createElement("img");
+        img.src = p.src; img.alt = "第 " + p.index + " 页预览";
+        img.loading = "lazy";
+        fig.appendChild(img);
+        var cap = document.createElement("figcaption");
+        cap.textContent = "第 " + p.index + " 页";
+        fig.appendChild(cap);
+        wrapFig.appendChild(fig);
+        box.appendChild(wrapFig);
+      });
+      var sr = $("srStatus");
+      sr.textContent = "共 " + data.page_count + " 页，已刷新预览";
+    });
+  }
+
+  function setNote(kind, title, text, actions) {
+    var box = $("statusBox");
+    box.innerHTML = "";
+    if (!title) { return; }
+    var el = document.createElement("div");
+    el.className = "note " + kind;
+    var b = document.createElement("b"); b.textContent = title; el.appendChild(b);
+    var s = document.createElement("span"); s.textContent = text; el.appendChild(s);
+    if (actions && actions.length) {
+      var row = document.createElement("div"); row.className = "actions";
+      actions.forEach(function (a) {
+        var btn = document.createElement("button");
+        btn.className = "btn btn-sm btn-ghost"; btn.type = "button";
+        btn.textContent = a.label; btn.addEventListener("click", a.run);
+        row.appendChild(btn);
+      });
+      el.appendChild(row);
+    }
+    box.appendChild(el);
+  }
+
+  // ---------------- 打印 / 返回：两个出口 ----------------
+  var printing = false;
+  $("btnPrint").addEventListener("click", function () {
+    if (printing) { return; }
+    setNote("", null, "", []);
+    var btn = $("btnPrint");
+    printing = true; btn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = "正在提交…";
+    post("/preview/" + PREVIEW_ID + "/print", JSON.stringify({ layout: LAYOUT }), function (data, status) {
+      if (status === 401 || (data && data.need_password)) { location.href = "/"; return; }
+      if (!data || !data.ok) {
+        printing = false; btn.disabled = false; btn.textContent = label;
+        if (data && data.expired) { setNote("warn", "预览已过期", "请返回上一页重新选择内容再打印。", []); }
+        else { toast((data && data.message) || "打印提交失败，请重试"); }
+        return;
+      }
+      btn.textContent = "打印中…";
+      poll(data.task_id, btn, label);
+    });
+  });
+
+  function poll(taskId, btn, label) {
+    var tries = 0;
+    var timerId = setInterval(function () {
+      tries++;
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/status/" + encodeURIComponent(taskId), true);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) { return; }
+        var data = {};
+        try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { return; }
+        if (data.status === "unknown" && tries < 4) { return; }
+        clearInterval(timerId);
+        btn.textContent = label; btn.disabled = false; printing = false;
+        if (data.status === "done") {
+          setNote("ok", "已提交到打印机", "共 " + ($("pageCount").textContent || "") + " 页，打印机很快就会出纸。", []);
+          toast("已送到打印机");
+        } else if (data.status === "printing" || data.status === "queued") {
+          setNote("ok", "正在打印", "任务已经在打印机队列里，请稍等。", []);
+        } else {
+          var info = REASON_TEXT[data.reason] || REASON_TEXT.printer_error_generic;
+          setNote("bad", info[0], info[1], [
+            { label: "重新检测打印机", run: refreshPrinter },
+            { label: "返回继续编辑", run: goBack }
+          ]);
+        }
+      };
+      xhr.onerror = function () {
+        clearInterval(timerId);
+        btn.textContent = label; btn.disabled = false; printing = false;
+        setNote("warn", "无法确认打印结果", "网络断开了，请到电脑上看一眼打印机队列。", []);
+      };
+      xhr.send(null);
+    }, 1500);
+  }
+
+  function refreshPrinter() {
+    toast("正在重新检测打印机…");
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/status/printer/refresh", true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      setTimeout(loadPrinter, 1200);
+    };
+    xhr.onerror = function () { setNote("warn", "重新检测失败", "打印机状态暂时读不到，可以直接重试打印。", []); };
+    xhr.send(null);
+  }
+
+  function loadPrinter() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/status/printer", true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      var data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { return; }
+      var p = data.printer;
+      if (!p) { return; }
+      var pill = $("printerPill");
+      pill.hidden = false;
+      if (p.state === "ok") {
+        pill.textContent = "打印机就绪";
+        pill.style.color = "var(--ok)";
+      } else if (p.state === "checking") {
+        pill.textContent = "检测中…";
+        pill.style.color = "";
+      } else if (p.state === "unknown") {
+        pill.hidden = true;
+      } else {
+        pill.textContent = p.message || "打印机异常";
+        pill.style.color = "var(--bad)";
+        // 异常直接在预览页给出处理入口，不用等打印失败才知道。
+        setNote("warn", p.message || "打印机异常", p.hint || "请先处理好打印机，再回来打印。", [
+          { label: "重新检测打印机", run: refreshPrinter }
+        ]);
+      }
+    };
+    xhr.send(null);
+  }
+
+  // 返回：只做取消会话，不写入、不修改原始数据
+  function goBack() {
+    try {
+      if (navigator.sendBeacon) { navigator.sendBeacon("/preview/" + PREVIEW_ID + "/cancel"); }
+      else { fetch("/preview/" + PREVIEW_ID + "/cancel", { method: "POST", keepalive: true }); }
+    } catch (e) {}
+    if (window.history.length > 1) { window.history.back(); }
+    else { window.location.href = "/"; }
+    // 极少数浏览器 history.back 不生效时兜底
+    setTimeout(function () { window.location.href = "/"; }, 700);
+  }
+  $("btnBack").addEventListener("click", function () {
+    if (printing) { toast("任务正在打印，请稍候"); return; }
+    goBack();
+  });
+
+  // 屏蔽绕过预览的快捷键：Enter / Ctrl+P / Cmd+P 都只能走上面的“打印”按钮
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (e.target && e.target.tagName === "INPUT")) {
+      e.preventDefault(); scheduleRender(true); return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === "p" || e.key === "P")) {
+      e.preventDefault();
+      toast("请在预览页点右上角“打印”");
+      $("btnPrint").click();
+      return;
+    }
+    if (e.key === "Escape") { goBack(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) { e.preventDefault(); }
+  });
+
+  // ---------------- 启动 ----------------
+  var KIND_LABEL = { text: "文字打印", image: "图片打印", pdf: "文件打印", images: "演示文稿打印" };
+  $("pvKind").textContent = "打印预览 · " + (KIND_LABEL[KIND] || "打印");
+  $("pvName").textContent = {{ name_json|safe }};
+  if (KIND === "pdf" || KIND === "images") {
+    var tip = document.createElement("div");
+    tip.className = "hintline";
+    tip.textContent = "文件类内容按整页等比缩放，字号与行距不适用。";
+    $("btnResetAll").parentNode.insertBefore(tip, $("btnResetAll"));
+  }
+  syncUI();
+  skeleton(2);
+  render();
+  loadPrinter();
 })();
 </script>
 </body>
@@ -2798,7 +4459,90 @@ ERROR_HTML = r"""<!doctype html>
 
 
 def _is_api_request() -> bool:
-    return request.path.startswith("/print/") or request.path.startswith("/status/")
+    path = request.path
+    if path.startswith("/print/") or path.startswith("/status/"):
+        return True
+    # /preview/<id> 是给人看的页面（未登录要跳回首页），其余才是接口。
+    return path.startswith("/preview/") and request.method != "GET"
+
+
+def _render_json():
+    """按既有格式返回一个失败响应，不暴露任何异常细节。"""
+    return jsonify(ok=False), 400
+
+
+def _request_layout(default: Optional[LayoutSpec] = None) -> LayoutSpec:
+    """
+    从请求里取出版面参数：JSON body 直接字段、{"layout": {...}}，
+    或表单字段 layout="<json>"。缺失/非法一律回落到默认值。
+    """
+    raw = None
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        if isinstance(payload.get("layout"), dict):
+            raw = payload["layout"]
+        else:
+            raw = payload
+    if raw is None:
+        raw_text = request.form.get("layout")
+        if raw_text:
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except ValueError:
+                raw = None
+    if not isinstance(raw, dict):
+        return default or DEFAULT_LAYOUT
+    return normalize_layout(raw)
+
+
+_GATE_OPEN = object()
+
+
+def _preview_gate(
+    expected_kind: Optional[str] = None,
+) -> tuple[object, Optional[tuple]]:
+    """
+    旧打印接口的强制预览门禁。
+
+    返回值有两种情况：
+      * (True 的哨兵, None)：REQUIRE_PREVIEW 关闭，按老行为放行；
+      * (PreviewSession, None)：门禁通过，接下来必须用它携带的内容和版面打印；
+      * (None, (响应, 状态码))：调用方应当直接返回这个响应。
+    """
+    if not REQUIRE_PREVIEW:
+        return _GATE_OPEN, None
+
+    preview_id = None
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        preview_id = payload.get("preview_id")
+    if not preview_id:
+        preview_id = request.form.get("preview_id")
+    if not preview_id:
+        preview_id = request.args.get("preview_id")
+
+    session = _get_preview(preview_id)
+    if session is None:
+        return None, (
+            jsonify(
+                ok=False,
+                need_preview=True,
+                message="请先在预览页确认版面后再打印",
+            ),
+            403,
+        )
+    if expected_kind and session.kind != expected_kind:
+        return None, (
+            jsonify(
+                ok=False,
+                need_preview=True,
+                message="预览内容已变化，请重新预览后再打印",
+            ),
+            403,
+        )
+    return session, None
 
 
 def unlock_required(view):
@@ -2954,6 +4698,17 @@ def _save_uploaded_image(upload) -> Path:
 @app.post("/print/text")
 @unlock_required
 def print_text():
+    """
+    【已由预览流程接管】必须携带有效 preview_id 才会真正打印。
+
+    请求格式与过去保持一致（JSON body 里的 text 字段仍然存在），
+    但实际打印的内容与版面一律取自 preview_id 对应的预览会话，
+    因此任何绕过预览页的直接调用都会被拦下来。
+    """
+    session, denied = _preview_gate("text")
+    if denied:
+        return denied
+
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return _friendly_api_failure()
@@ -2965,6 +4720,13 @@ def print_text():
     text = text.replace("\x00", "").strip()
     if not text or len(text) > MAX_TEXT_CHARS:
         return _friendly_api_failure()
+
+    if session is not _GATE_OPEN:
+        # 内容以预览会话为准，版面同样沿用预览页确认过的参数。
+        session.layout = _request_layout(session.layout)
+        task_id = _enqueue_preview_print(session, session.owns_work_dir)
+        _drop_preview(session.preview_id)
+        return jsonify(ok=True, task_id=task_id)
 
     task_id = uuid.uuid4().hex
     txt_path = TEMP_DIR / (task_id + ".txt")
@@ -2998,9 +4760,25 @@ def print_text():
 @app.post("/print/image")
 @unlock_required
 def print_image():
+    """
+    【已由预览流程接管】必须携带有效 preview_id 才会真正打印。
+
+    表单里的 image 字段保留，但实际打印的是预览会话里那份已校验过的图片，
+    版面也沿用预览页确认过的参数。
+    """
+    session, denied = _preview_gate("image")
+    if denied:
+        return denied
+
     upload = request.files.get("image")
     if upload is None:
         return _friendly_api_failure()
+
+    if session is not _GATE_OPEN:
+        session.layout = _request_layout(session.layout)
+        task_id = _enqueue_preview_print(session, session.owns_work_dir)
+        _drop_preview(session.preview_id)
+        return jsonify(ok=True, task_id=task_id)
 
     try:
         image_path = _save_uploaded_image(upload)
@@ -3076,12 +4854,35 @@ def prepare_file():
 @app.post("/print/file/<file_id>")
 @unlock_required
 def print_file(file_id: str):
+    """
+    【已由预览流程接管】必须先经过预览页，携带与该文件匹配的 preview_id。
+
+    URL、入参与返回格式都不变，只是多了一个必须先在预览页确认版面的前置条件。
+    """
     if not re.fullmatch(r"[0-9a-f]{32}", file_id or ""):
         return jsonify(ok=False, message="文件已过期，请重新选择"), 400
+
+    session, denied = _preview_gate()
+    if denied:
+        return denied
 
     record = _take_prepared(file_id)
     if record is None:
         return jsonify(ok=False, message="文件已过期，请重新选择"), 400
+
+    if session is not _GATE_OPEN:
+        # 预览会话必须指向同一份内容，防止拿着 A 的预览去打印 B。
+        if record.print_path != session.source_path:
+            _store_prepared(record)
+            return (
+                jsonify(ok=False, message="预览内容已变化，请重新预览后再打印"),
+                403,
+            )
+        session.layout = _request_layout(session.layout)
+        session.source_ref = ""
+        task_id = _enqueue_preview_print(session, True)
+        _drop_preview(session.preview_id)
+        return jsonify(ok=True, task_id=task_id)
 
     task_id = uuid.uuid4().hex
     try:
@@ -3101,6 +4902,340 @@ def print_file(file_id: str):
 
     log.info("收到文件打印任务 %s：%s", task_id[:8], record.name)
     return jsonify(ok=True, task_id=task_id)
+
+
+# =============================================================================
+# 八-B、打印前预览：创建会话 / 实时重渲染 / 确认打印 / 取消
+# =============================================================================
+
+
+@app.get("/preview/<preview_id>")
+@unlock_required
+def preview_page(preview_id: str):
+    """预览页本体：内置排版编辑器，只有“打印”和“返回继续编辑”两个出口。"""
+    session = _get_preview(preview_id)
+    if session is None:
+        return redirect(url_for("index"))
+    return _compiled_template(PREVIEW_HTML).render(
+        preview_id_json=json.dumps(session.preview_id),
+        kind_json=json.dumps(session.kind),
+        name_json=json.dumps(session.name),
+        layout_json=json.dumps(session.layout.to_dict()),
+        defaults_json=json.dumps(DEFAULT_LAYOUT.to_dict()),
+        page_sizes_json=json.dumps(list(PAGE_SIZES_MM.keys())),
+        max_return_pages=PREVIEW_MAX_RETURN_PAGES,
+    )
+
+
+def _preview_created(session: PreviewSession) -> tuple:
+    """会话创建成功后：立刻渲染一次并返回给前端（页数 + 首批预览图）。"""
+    if session.layout is None:
+        session.layout = DEFAULT_LAYOUT
+    _store_preview(session)
+    page_count = _preview_page_count(session)
+    pages: list[dict] = []
+    for index, image in enumerate(_iter_preview_pages(session, PREVIEW_DPI)):
+        if index >= min(PREVIEW_MAX_RETURN_PAGES, PREVIEW_MAX_RENDER_PAGES):
+            break
+        pages.append(
+            {
+                "index": index + 1,
+                "width": image.width,
+                "height": image.height,
+                "src": _to_preview_data_uri(image, PREVIEW_THUMB_EDGE),
+            }
+        )
+    log.info(
+        "创建预览会话 %s：%s，%s 页", session.preview_id[:8], session.name,
+        page_count,
+    )
+    return (
+        jsonify(
+            ok=True,
+            preview_id=session.preview_id,
+            name=session.name,
+            kind=session.kind,
+            page_count=page_count,
+            returned=len(pages),
+            layout=session.layout.to_dict(),
+            pages=pages,
+        ),
+        200,
+    )
+
+
+@app.post("/preview/text")
+@unlock_required
+def preview_text():
+    """文字入口：把这段字存成会话，返回预览会话 ID。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(ok=False, message="没有收到文字内容"), 400
+
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return jsonify(ok=False, message="没有收到文字内容"), 400
+
+    text = text.replace("\x00", "").strip()
+    if not text:
+        return jsonify(ok=False, message="请输入要打印的文字"), 400
+    if len(text) > MAX_TEXT_CHARS:
+        return jsonify(ok=False, message="文字太多，请分几次打印"), 400
+
+    session = _create_text_preview(text)
+    session.layout = _request_layout()
+    try:
+        return _preview_created(session)
+    except Exception:
+        _drop_preview(session.preview_id)
+        _delete_path(session.work_dir)
+        log.exception("生成文字预览失败")
+        return jsonify(ok=False, message="预览生成失败，请重试"), 400
+
+
+@app.post("/preview/image")
+@unlock_required
+def preview_image():
+    """图片入口：校验后存成会话，返回预览会话 ID。"""
+    upload = request.files.get("image")
+    if upload is None:
+        return jsonify(ok=False, message="请先选择一张图片"), 400
+    try:
+        work_dir = _new_work_dir("img_")
+        work_dir.mkdir(parents=True, exist_ok=False)
+        image_path = _save_uploaded_image(upload)
+        final_path = work_dir / ("source" + image_path.suffix)
+        image_path.replace(final_path)
+    except ValueError as exc:
+        log.warning("图片校验未通过：%s", exc)
+        return jsonify(ok=False, message=str(exc)), 400
+    except Exception:
+        log.exception("准备图片预览失败")
+        return jsonify(ok=False, message="图片无法识别，请换一张试试"), 400
+
+    session = PreviewSession(
+        preview_id=uuid.uuid4().hex,
+        kind="image",
+        name=upload.filename or "图片",
+        source_path=final_path,
+        work_dir=work_dir,
+        layout=_request_layout(),
+    )
+    try:
+        # 无论副本有多大，在这里就把 EXIF 方向校正后的尺寸算清楚，避免 50MP 炸弹。
+        return _preview_created(session)
+    except Exception:
+        _delete_path(work_dir)
+        log.exception("生成图片预览失败")
+        return jsonify(ok=False, message="预览生成失败，请重试"), 400
+
+
+@app.post("/preview/file")
+@unlock_required
+def preview_file_upload():
+    """文件入口：上传并解析后直接建立预览会话（跳过旧的“先预览三页再确认”）。"""
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify(ok=False, message="请先选择要打印的文件"), 400
+    try:
+        record, _previews = _prepare_upload(upload)
+    except UserFacingError as exc:
+        return jsonify(ok=False, message=str(exc)), 400
+    except Exception:
+        log.exception("准备上传文件失败")
+        return jsonify(ok=False, message="文件处理失败，请换一个文件再试"), 400
+
+    session = _session_from_prepared(record, owns=True)
+    session.layout = _request_layout()
+    try:
+        return _preview_created(session)
+    except Exception:
+        _delete_path(session.work_dir)
+        log.exception("生成文件预览失败")
+        return jsonify(ok=False, message="预览生成失败，请重试"), 400
+
+
+@app.post("/preview/file/<file_id>")
+@unlock_required
+def preview_file_from_prepared(file_id: str):
+    """
+    把已经在“待打印文件”里的记录转成预览会话。
+
+    会话不接管临时目录（owns_work_dir=False），所以在预览页点“返回继续编辑”
+    不会删掉原文件，用户可以回到文件卡片继续操作。
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id or ""):
+        return jsonify(ok=False, message="文件已过期，请重新选择"), 400
+    with _prepared_lock:
+        record = _prepared_files.get(file_id)
+    if record is None:
+        return jsonify(ok=False, message="文件已过期，请重新选择"), 400
+
+    session = _session_from_prepared(record, owns=False)
+    session.layout = _request_layout()
+    try:
+        return _preview_created(session)
+    except Exception:
+        log.exception("由待打印文件生成预览失败")
+        return jsonify(ok=False, message="预览生成失败，请重试"), 400
+
+
+@app.post("/preview/<preview_id>/render")
+@unlock_required
+def preview_render(preview_id: str):
+    """
+    参数变更后重新渲染预览。
+
+    只更新 session 里的版面参数，绝不改写原始内容；
+    分页、换行、裁切全部由同一套渲染函数算出，因此与打印输出一致。
+    """
+    session = _get_preview(preview_id)
+    if session is None:
+        return jsonify(ok=False, expired=True, message="预览已过期，请重新选择内容"), 400
+
+    spec = _request_layout()
+    session.layout = spec
+
+    started = time.perf_counter()
+    page_count = _preview_page_count(session)
+    pages: list[dict] = []
+    rendered = 0
+    try:
+        for image in _iter_preview_pages(session, PREVIEW_DPI):
+            rendered += 1
+            if rendered > PREVIEW_MAX_RENDER_PAGES:
+                break
+            if len(pages) < PREVIEW_MAX_RETURN_PAGES:
+                pages.append(
+                    {
+                        "index": rendered,
+                        "width": image.width,
+                        "height": image.height,
+                        "src": _to_preview_data_uri(image, PREVIEW_THUMB_EDGE),
+                    }
+                )
+            if rendered >= PREVIEW_MAX_RETURN_PAGES:
+                break
+    except Exception:
+        log.exception("渲染预览失败")
+        return jsonify(ok=False, message="预览渲染失败，请调整参数后重试"), 400
+
+    return jsonify(
+        ok=True,
+        preview_id=session.preview_id,
+        page_count=page_count,
+        returned=len(pages),
+        layout=session.layout.to_dict(),
+        pages=pages,
+        render_ms=int((time.perf_counter() - started) * 1000),
+    )
+
+
+@app.post("/preview/<preview_id>/print")
+@unlock_required
+def preview_print(preview_id: str):
+    """预览页的“打印”出口：全项目唯一的内容入队打印通道。"""
+    session = _get_preview(preview_id)
+    if session is None:
+        return jsonify(ok=False, expired=True, message="预览已过期，请重新选择内容"), 400
+
+    spec = _request_layout(session.layout)
+    session.layout = spec
+
+    if _preview_page_count(session) <= 0:
+        return jsonify(ok=False, message="这份内容没有可打印的页面"), 400
+
+    # 内容来自“待打印文件”列表时，把那笔记录接管过来，避免它被重复打印/重复清理。
+    cleanup_work_dir = session.owns_work_dir
+    if not session.owns_work_dir and session.source_ref:
+        with _prepared_lock:
+            _prepared_files.pop(session.source_ref, None)
+        cleanup_work_dir = True
+
+    try:
+        task_id = _enqueue_preview_print(session, cleanup_work_dir)
+    except Exception:
+        log.exception("预览确认打印失败")
+        if cleanup_work_dir:
+            _delete_path(session.work_dir)
+        return jsonify(ok=False, message="打印提交失败，请重试"), 400
+
+    # 一次会话只允许打印一次：打印后再点返回不会重复出纸。
+    _drop_preview(preview_id)
+    return jsonify(ok=True, task_id=task_id)
+
+
+@app.post("/preview/<preview_id>/cancel")
+@unlock_required
+def preview_cancel(preview_id: str):
+    """
+    预览页的“返回继续编辑”出口：取消会话，不打印、不改写任何原始数据。
+
+    owns_work_dir=False 的会话不删目录，方便用户回到主页继续编辑同一个文件。
+    """
+    session = _drop_preview(preview_id)
+    if session is not None and session.owns_work_dir:
+        _delete_path(session.work_dir)
+    return jsonify(ok=True)
+
+
+@app.get("/status/printer")
+@unlock_required
+def printer_state():
+    """查询启动自检得到的打印机状态（不阻塞：读的是缓存快照）。"""
+    return jsonify(ok=True, printer=_printer_snapshot())
+
+
+@app.get("/wechat/jsconfig")
+@unlock_required
+def wechat_jsconfig():
+    """
+    给微信 JS-SDK 下发注入配置（可选能力，默认关闭）。
+
+    只有同时满足“开关打开 + 填了 AppID/AppSecret + 能取到 jsapi_ticket”
+    才返回签名；任何一步失败都返回 ok=False，前端会直接走原生文件选择器，
+    不影响“从聊天里选文件再打印”这条主流程。
+    """
+    if not WECHAT_JSAPI_ENABLED:
+        return jsonify(ok=False, enabled=False, reason="disabled")
+    if not WECHAT_APPID or not WECHAT_APPSECRET:
+        return jsonify(ok=False, enabled=False, reason="not_configured")
+
+    page_url = request.args.get("url", "")
+    if not page_url or not page_url.startswith(("http://", "https://")):
+        return jsonify(ok=False, enabled=False, reason="bad_url")
+
+    ticket, reason = _wechat_jsapi_ticket()
+    if not ticket:
+        return jsonify(ok=False, enabled=False, reason=reason)
+
+    nonce = secrets.token_hex(8)
+    timestamp = int(time.time())
+    raw = (
+        "jsapi_ticket=" + ticket
+        + "&noncestr=" + nonce
+        + "&timestamp=" + str(timestamp)
+        + "&url=" + page_url
+    )
+    signature = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return jsonify(
+        ok=True,
+        enabled=True,
+        appId=WECHAT_APPID,
+        timestamp=timestamp,
+        nonceStr=nonce,
+        signature=signature,
+        jsApiList=["chooseMessageFile", "uploadFile"],
+        max_file_bytes=FILE_MAX_BYTES,
+    )
+
+
+@app.post("/status/printer/refresh")
+@unlock_required
+def printer_refresh():
+    """手动重探打印机状态。请求立即返回，检测在后台线程进行。"""
+    started = _refresh_printer_state_async()
+    return jsonify(ok=True, started=started, printer=_printer_snapshot())
 
 
 @app.get("/status/<task_id>")
@@ -3167,19 +5302,21 @@ def _export_wall_qr_async() -> None:
 
 
 def _probe_printer_async() -> None:
-    """打印机探测放到后台线程：个别电脑上 spooler 卡顿时也不会拖慢启动。"""
+    """
+    启动自检放到后台线程：个别电脑上打印服务卡顿时也不会拖慢“可以扫码”。
+
+    检测结果写入全局快照，网页可通过 /status/printer 查询，
+    也可以随时点“重新检测”再跑一次；整个过程不阻塞网页服务。
+    """
 
     def job() -> None:
-        try:
-            default_printer = _get_default_printer()
-        except Exception:
-            log.exception("启动时检测默认打印机失败")
-            default_printer = None
-        if default_printer:
-            print("✅ 默认打印机：" + str(default_printer))
+        snapshot = _probe_printer_once()
+        if snapshot["state"] == "ok":
+            print("🖨️ 默认打印机已就绪：" + str(snapshot["name"]) + "（后台检测结果，不影响扫码）")
         else:
-            print("⚠️ 警告：没有检测到默认打印机，现在提交会打印失败。")
-            print("   请打开：Windows 设置 → 蓝牙和其他设备 → 打印机和扫描仪，设置默认打印机。")
+            print("🖨️ 打印机状态：" + str(snapshot["message"]))
+            print("   处理办法：" + str(snapshot["hint"]))
+            print("   处理完可在网页点“重新检测”，或直接打开 Windows 打印机设置。")
 
     threading.Thread(target=job, name="printer-probe", daemon=True).start()
 
