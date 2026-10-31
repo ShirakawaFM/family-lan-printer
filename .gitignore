@@ -32,3 +32,6 @@ frpc.toml
 frpc.log
 启动家庭打印.bat
 停止家庭打印.bat
+
+# Release packages built by tools/build_release.py
+dist/

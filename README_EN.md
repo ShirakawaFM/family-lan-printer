@@ -33,6 +33,21 @@ Both include `print_server.py`, dependencies, README and screenshots. The public
 
 ---
 
+## Which build to download
+
+The releases page ships two archives — pick one:
+
+| Build | For | Download |
+| --- | --- | --- |
+| **LAN build** | home use on the same Wi-Fi, no cloud server needed | [family-lan-printer-lan-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-lan-v1.2.0.zip) |
+| **Public build** | access over 4G/5G, needs a cloud server | [family-lan-printer-public-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-public-v1.2.0.zip) |
+
+Both contain the full `print_server.py`, `requirements.txt`, both READMEs and the screenshots. The public build additionally contains `deploy-public/`: the fill-in sheet, the cloud/Windows one-shot scripts and the optional HTTPS guide.
+
+> If you are unsure, take the **LAN build**. The public build involves a cloud server, security groups and frp; follow the guide inside the archive.
+
+Both archives are built by GitHub Actions on tag push (`tools/build_release.py`) and are reproducible: identical content always yields the same SHA256, which is published in the release notes.
+
 ## Three steps to run it
 
 <div align="center">

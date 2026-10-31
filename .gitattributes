@@ -4,3 +4,5 @@
 *.ps1 text eol=crlf
 *.bat text eol=crlf
 *.toml text eol=lf
+# 打包说明用 CRLF，记事本双击打开不会挤成一行。
+pack/**/*.txt text eol=crlf

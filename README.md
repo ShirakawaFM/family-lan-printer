@@ -36,6 +36,8 @@ Release 提供两个压缩包，按需要选一个即可：
 
 > 不确定就选 **LAN 局域网版**。公网版涉及云服务器、安全组和 frp，按包里的教程操作。
 
+两个包都是打标签时由 GitHub Actions 自动构建的（`tools/build_release.py`），可复现：同样的内容永远得到同样的 SHA256，发布说明里会附上校验和。
+
 ---
 
 ## 三步跑起来
@@ -750,6 +752,11 @@ family-lan-printer/
 │  ├─ pipeline.svg               # 一次打印的完整链路
 │  ├─ divider.svg                # 章节分隔线
 │  └─ footer.svg                 # 页脚签名
+├─ pack/                            # Release 两个包的「先看」快速上手说明
+│  ├─ lan/先看-局域网版.txt
+│  └─ public/先看-公网版.txt
+├─ tools/
+│  └─ build_release.py              # 构建 Release 两个压缩包（可复现）
 ├─ docs/
 │  ├─ screenshot-print.png          # 桌面端深色主页（README 主图）
 │  ├─ screenshot-print-light.png    # 桌面端浅色主页
@@ -769,7 +776,8 @@ family-lan-printer/
 │  └─ optional-https/
 └─ .github/
    └─ workflows/
-      └─ python-check.yml       # 语法检查 CI
+      ├─ python-check.yml       # 语法检查 CI
+      └─ release.yml            # 打标签自动构建并发布两个包
 ```
 
 运行后会额外生成（已在 `.gitignore` 中忽略）：

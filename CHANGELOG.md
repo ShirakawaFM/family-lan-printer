@@ -25,6 +25,9 @@
 ### 发布
 
 - Release 提供两个完整压缩包：**LAN 局域网版**（无需云服务器）和**公网部署版**（含 `deploy-public/` 填写单、frps/frpc 脚本和 HTTPS 教程）。
+- 新增 `tools/build_release.py` 与 `.github/workflows/release.yml`：打 `v*` 标签即自动构建两个包、生成含 SHA256 的发布说明并上传；Release 已存在时走附件更新，可安全重跑。
+- 构建可复现：zip 内路径统一用正斜杠、时间戳固定，同样内容永远得到同样的 SHA256；`02-云服务器-运行这个.sh` 保持 LF，下载到 Linux 直接能跑。
+- 新增 `pack/lan/先看-局域网版.txt` 与 `pack/public/先看-公网版.txt`，随包分发的快速上手说明纳入版本控制。
 
 ### 兼容性说明（重要）
 

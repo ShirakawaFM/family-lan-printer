@@ -1,0 +1,18 @@
+﻿家庭打印 · 公网部署版（{VER}）
+================================
+
+适合：需要在外面用 4G/5G 访问家里打印机，需要一台有公网 IP 的云服务器。
+
+本包 = 完整打印程序 + deploy-public 公网部署包。
+
+1. 先看 deploy-public/00-先看-公网部署教程.md。
+2. 用记事本填 deploy-public/01-先填-部署信息.txt，所有（）都要替换。
+3. 云服务器安全组放行 7000/TCP 和 6000/TCP。
+4. 把 deploy-public/server/02-云服务器-运行这个.sh 上传到服务器并运行。
+5. 在家里 Windows 上运行 deploy-public/windows/03-家里电脑-运行这个.ps1。
+6. 手机用 4G 打开 http://（云服务器公网 IP）:（外网访问端口）。
+
+打印前会先进预览页，可以在里面调纸张、方向、页边距、缩放、字号和行距。
+
+公网 HTTP 的密码不是加密传输；长期使用请按 deploy-public/optional-https 加 HTTPS。
+正式使用前，先把 print_server.py 里的 ACCESS_PASSWORD 改成强密码。
