@@ -994,26 +994,35 @@ def _take_prepared(file_id: str) -> Optional[PreparedFile]:
 # =============================================================================
 
 # Windows 打印机状态位。驱动/系统不一定上报全部状态，这里只做打印前尽力检查。
+# 顺序就是排查优先级：缺纸、卡纸、离线最常见，放在前面。
 _PRINTER_BAD_STATUS = (
-    (0x00000001, "打印机已暂停"),
-    (0x00000002, "打印机报错"),
-    (0x00000004, "打印任务异常"),
-    (0x00000008, "打印机卡纸"),
-    (0x00000010, "打印机缺纸"),
-    (0x00000040, "打印机纸张故障"),
-    (0x00000080, "打印机离线"),
-    (0x00000800, "打印机出纸口已满"),
-    (0x00001000, "打印机不可用"),
-    (0x00040000, "打印机缺墨或墨粉"),
-    (0x00080000, "打印机无法打印当前页"),
-    (0x00100000, "打印机需要人工处理"),
-    (0x00200000, "打印机内存不足"),
-    (0x00400000, "打印机盖未关好"),
-    (0x02000000, "打印机服务器离线"),
+    (0x00000010, "打印机缺纸", "paper_out"),
+    (0x00000008, "打印机卡纸", "paper_jam"),
+    (0x00000080, "打印机离线", "offline"),
+    (0x00400000, "打印机盖未关好", "door_open"),
+    (0x00040000, "打印机缺墨或墨粉", "no_toner"),
+    (0x00000001, "打印机已暂停", "paused"),
+    (0x00000002, "打印机报错", "printer_error"),
+    (0x00000040, "打印机纸张故障", "paper_problem"),
+    (0x00000800, "打印机出纸口已满", "output_full"),
+    (0x00001000, "打印机不可用", "not_available"),
+    (0x02000000, "打印机服务器离线", "server_offline"),
+    (0x00080000, "打印机无法打印当前页", "page_punt"),
+    (0x00100000, "打印机需要人工处理", "user_intervention"),
+    (0x00200000, "打印机内存不足", "out_of_memory"),
+    (0x00000004, "打印任务异常", "pending_deletion"),
 )
 # 注意：0x00000200（忙）、0x00000400（正在打印）、0x00800000（状态未知）、
 # 0x01000000（省电休眠）属于正常/未知状态，不能当故障。
 # 这里只列会阻止打印的状态位（依据 Windows winspool 的 PRINTER_STATUS_* 定义）。
+
+
+class PrinterUnavailable(RuntimeError):
+    """默认打印机不可用，带一个前端可映射的稳定原因代码。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _get_default_printer() -> Optional[str]:
@@ -1024,7 +1033,7 @@ def _get_default_printer() -> Optional[str]:
         return None
 
 
-def _printer_status_problem(printer_name: str) -> Optional[str]:
+def _printer_status_problem(printer_name: str) -> Optional[tuple[str, str]]:
     """读取默认打印机状态；读取失败不阻止打印，只记录日志。"""
     handle = None
     try:
@@ -1041,18 +1050,21 @@ def _printer_status_problem(printer_name: str) -> Optional[str]:
             except Exception:
                 pass
 
-    problems = [text for bit, text in _PRINTER_BAD_STATUS if status & bit]
-    return "、".join(problems) if problems else None
+    for bit, text, code in _PRINTER_BAD_STATUS:
+        if status & bit:
+            return code, text
+    return None
 
 
 def _get_ready_printer() -> str:
     """取默认打印机并做基本状态检查，异常统一抛给后台打印线程。"""
     printer_name = _get_default_printer()
     if not printer_name:
-        raise RuntimeError("没有设置默认打印机")
+        raise PrinterUnavailable("no_printer", "没有设置默认打印机")
     problem = _printer_status_problem(printer_name)
     if problem:
-        raise RuntimeError(problem)
+        code, text = problem
+        raise PrinterUnavailable(code, text)
     return printer_name
 
 
@@ -1153,21 +1165,21 @@ class PrintJob:
 PRINT_QUEUE: "queue.Queue[PrintJob]" = queue.Queue()
 
 _STATUS_LOCK = threading.Lock()
-_TASK_STATUS: dict[str, tuple[str, float]] = {}
+_TASK_STATUS: dict[str, tuple[str, str, float]] = {}
 
 
-def _set_task_status(task_id: str, status: str) -> None:
+def _set_task_status(task_id: str, status: str, reason: str = "") -> None:
     with _STATUS_LOCK:
-        _TASK_STATUS[task_id] = (status, time.time())
+        _TASK_STATUS[task_id] = (status, reason, time.time())
         # 状态只用于页面轮询，保留最近 300 个，避免长期运行占内存。
         while len(_TASK_STATUS) > 300:
             _TASK_STATUS.pop(next(iter(_TASK_STATUS)))
 
 
-def _get_task_status(task_id: str) -> str:
+def _get_task_state(task_id: str) -> tuple[str, str]:
     with _STATUS_LOCK:
         item = _TASK_STATUS.get(task_id)
-    return item[0] if item else "unknown"
+    return (item[0], item[1]) if item else ("unknown", "")
 
 
 def _schedule_temp_cleanup(
@@ -1211,9 +1223,14 @@ def _print_worker() -> None:
                 raise RuntimeError("未知的打印任务类型")
             _set_task_status(job.task_id, "done")
             log.info("打印任务完成 %s", job.task_id[:8])
+        except PrinterUnavailable as exc:
+            _set_task_status(job.task_id, "error", exc.code)
+            # 具体原因只用于前端中文提示；控制台保留完整日志。
+            log.error("打印失败（%s）：%s", exc.code, exc)
+            log.error("%s", traceback.format_exc())
         except Exception as exc:
-            _set_task_status(job.task_id, "error")
-            # 只写控制台，前端只会看到统一的中文失败提示。
+            _set_task_status(job.task_id, "error", "printer_error")
+            # 只写控制台，前端只看到中文原因和解决办法。
             log.error("打印失败：%s", exc)
             log.error("%s", traceback.format_exc())
         finally:
@@ -1475,6 +1492,18 @@ PAGE_HTML = r"""<!doctype html>
     background: #FDECEA;
     border: 3px solid #B71C1C;
   }
+  .status-help {
+    display: none;
+    margin-top: 10px;
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.5;
+  }
+  .status.bad .status-help { display: block; }
+  .status-help p { margin: 8px 0 0; }
+  .status-help ul { margin: 8px 0 0 1.2em; padding: 0; }
+  .status-help li { margin: 8px 0; }
+  .status-help strong { font-weight: 900; }
   @media (max-width: 360px) {
     button { font-size: 28px; }
   }
@@ -1512,14 +1541,17 @@ PAGE_HTML = r"""<!doctype html>
     </div>
   </section>
 
-  <div id="statusBox" class="status" role="status" aria-live="polite"></div>
+  <div id="statusBox" class="status" role="status" aria-live="polite">
+    <div id="statusTitle"></div>
+    <div id="statusHelp" class="status-help"></div>
+  </div>
 
 <script>
 (function () {
   "use strict";
 
   var OK_TEXT = "✅ 提交成功，正在排队打印";
-  var BAD_TEXT = "❌ 打印失败，请检查打印机开机、连线、缺纸";
+  var FAIL_TEXT = "❌ 打印失败";
   var MAX_IMAGE_BYTES = {{ max_image_bytes }};
   var MAX_IMAGE_MB = Math.round(MAX_IMAGE_BYTES / (1024 * 1024));
   var MAX_FILE_BYTES = {{ max_file_bytes }};
@@ -1536,11 +1568,70 @@ PAGE_HTML = r"""<!doctype html>
   var filePreviewPages = document.getElementById("filePreviewPages");
   var confirmFileButton = document.getElementById("confirmFileButton");
   var statusBox = document.getElementById("statusBox");
+  var statusTitle = document.getElementById("statusTitle");
+  var statusHelp = document.getElementById("statusHelp");
   var currentFileId = null;
 
-  function showStatus(ok) {
+  var PRINT_REASON = {
+    paper_out: "打印机缺纸",
+    paper_jam: "打印机卡纸",
+    offline: "打印机离线或连接松动",
+    door_open: "打印机盖没有关好",
+    no_toner: "打印机缺墨或墨粉",
+    paused: "打印机被暂停",
+    no_printer: "电脑没有设置默认打印机",
+    output_full: "打印机出纸口满了",
+    not_available: "打印机当前不可用",
+    server_offline: "网络打印机离线",
+    paper_problem: "打印机纸张故障",
+    out_of_memory: "打印机内存不足",
+    user_intervention: "打印机需要人工处理",
+    page_punt: "打印机无法打印当前页",
+    printer_error: "打印机或驱动报错"
+  };
+
+  var REASON_EXTRA = {
+    no_printer: ["默认打印机：打开 Windows 设置 → 蓝牙和其他设备 → 打印机和扫描仪，点你的打印机 → 设为默认值。"],
+    door_open: ["打印机盖：打开再重新关紧墨盒/硒鼓盖和纸盒，听到卡扣声后再试。"],
+    no_toner: ["墨粉：检查墨盒/硒鼓是否装好，缺墨请更换或联系家人。"],
+    paused: ["暂停状态：在 Windows 打印机队列里点“继续”，或按打印机上的继续键。"],
+    output_full: ["出纸口：把已经打印出来的纸拿走，再重新提交。"]
+  };
+
+  function showStatus(ok, reason) {
     statusBox.className = ok ? "status ok" : "status bad";
-    statusBox.textContent = ok ? OK_TEXT : BAD_TEXT;
+    var known = PRINT_REASON[reason];
+    statusTitle.textContent = ok
+      ? OK_TEXT
+      : (known ? FAIL_TEXT + "：" + known : FAIL_TEXT);
+    statusHelp.innerHTML = "";
+    if (ok) {
+      return;
+    }
+
+    var intro = document.createElement("p");
+    intro.textContent = known
+      ? "请按下面的办法处理："
+      : "可能是缺纸、卡纸，或者打印机离线/连接松动。请按下面的办法处理：";
+    statusHelp.appendChild(intro);
+
+    var list = document.createElement("ul");
+    var items = [
+      ["缺纸：", "打开纸盒放入 A4 纸，把纸盒推回，按打印机上的“继续/开始”键，然后回到本页重新打印。"],
+      ["卡纸：", "打开打印机盖或后盖，顺着纸张走纸方向轻轻拉出，不要硬拽；关好盖，按“继续”键再试。"],
+      ["离线/线松：", "检查打印机电源、USB 线或 WiFi；到 Windows 设置里确认默认打印机在线，再重新提交。"],
+      ["其他：", "看电脑上的打印程序窗口或本程序控制台，按提示处理后再试一次。"]
+    ];
+    (REASON_EXTRA[reason] || []).forEach(function (extra) { items.unshift([extra.split("：")[0] + "：", extra.split("：").slice(1).join("：")]); });
+    items.forEach(function (item) {
+      var li = document.createElement("li");
+      var strong = document.createElement("strong");
+      strong.textContent = item[0];
+      li.appendChild(strong);
+      li.appendChild(document.createTextNode(item[1]));
+      list.appendChild(li);
+    });
+    statusHelp.appendChild(list);
   }
 
   function handleUnauthorized(response) {
@@ -1571,7 +1662,7 @@ PAGE_HTML = r"""<!doctype html>
             return;
           }
           if (data.status === "error") {
-            showStatus(false);
+            showStatus(false, data.reason || "");
             window.clearInterval(timer);
           } else if (data.status === "done" || data.status === "unknown") {
             window.clearInterval(timer);
@@ -2105,8 +2196,9 @@ def print_file(file_id: str):
 @unlock_required
 def task_status(task_id: str):
     if not re.fullmatch(r"[0-9a-f]{32}", task_id or ""):
-        return jsonify(status="unknown")
-    return jsonify(status=_get_task_status(task_id))
+        return jsonify(status="unknown", reason="")
+    status, reason = _get_task_state(task_id)
+    return jsonify(status=status, reason=reason)
 
 
 @app.errorhandler(HTTPException)

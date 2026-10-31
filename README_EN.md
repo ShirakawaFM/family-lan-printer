@@ -8,7 +8,7 @@
 
 [简体中文](README.md) · [English](README_EN.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.0-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.0.1-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
@@ -48,12 +48,12 @@ This project reduces it to:
 - **Print preview** — the first 3 pages are rendered as real page thumbnails; the user must confirm before all pages are printed.
 - **Serial print queue** — one worker consumes `queue.Queue`; jobs never print concurrently.
 - **Auto cleanup** — every temp file is deleted 30 seconds after its job ends; preview-only files expire after 30 minutes.
-- **Friendly errors** — the browser only shows two Chinese messages; stack traces and English error codes stay in the console.
+- **Friendly errors** — the browser shows the likely cause (paper out, paper jam, offline, door open, no toner, etc.) and a matching fix; stack traces and English error codes stay in the console.
 - **Optional remote access** — a complete frp tutorial is included at the end of the Python file. The web UI never displays an external QR code.
 - **Single-file deployment** — no frontend build, database, Docker, or cloud dependency.
 - **One-click-ish setup** — `pip install -r requirements.txt`, then `python print_server.py`.
 
-**Out of scope:** OCR, WeChat bots, cloud sync, Wi-Fi setup QR codes, user registration, print preview, layout controls.
+**Out of scope:** OCR, WeChat bots, cloud sync, Wi-Fi setup QR codes, user registration, layout controls.
 
 ## How it works
 

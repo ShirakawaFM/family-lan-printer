@@ -8,7 +8,7 @@
 
 [简体中文](README.md) · [English](README_EN.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.0-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.0.1-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
@@ -94,8 +94,8 @@
 | **保持原版式** | PDF 直接渲染；Word/Excel 通过本机 Microsoft Office 转 PDF；PPT 逐页导出 PNG，版式不变 |
 | **串行队列** | 所有任务进入线程安全队列，由唯一的后台线程依次打印，避免多任务把打印机搞崩 |
 | **临时文件自动清理** | 文字、图片和文件都先存到 `temp_print/`，任务结束 30 秒后自动删除；只预览未打印的文件 30 分钟后清理 |
-| **友好错误** | 前端只显示两种中文提示，不输出 Python 堆栈或英文错误码；详细日志留在控制台 |
-| **串行状态轮询** | 提交后显示「正在排队打印」，实际打印失败会自动变成「打印失败」提示 |
+| **友好错误** | 打印失败时直接显示可能原因（缺纸/卡纸/离线/盖未关/缺墨等）和对应解决办法，不输出 Python 堆栈或英文错误码 |
+| **串行状态轮询** | 提交后显示「正在排队打印」，实际打印失败会自动变成「打印失败」并展开处理办法 |
 | **外网访问教程** | 代码末尾附带 frp 内网穿透完整教程；网页永远只展示内网二维码 |
 | **开机自启教程** | 代码末尾附带 Windows 任务计划程序详细步骤，开机自动运行 |
 | **单文件部署** | 业务代码只有 `print_server.py` 一个文件，不生成前端构建产物 |
@@ -274,7 +274,21 @@ python print_server.py
 5. 想打印照片：点「选择手机相册图片打印」，选图，点蓝色「打印图片」；
 6. 想打印文件/聊天文件：点「打印手机文件 / 微信聊天文件」里的文件框，选文件后点「预览文件」，确认预览效果，再点「确认打印这份文件」；
 7. 看到「✅ 提交成功，正在排队打印」就是提交成功；
-8. 如果看到「❌ 打印失败，请检查打印机开机、连线、缺纸」，叫家里人检查打印机。
+8. 如果看到「❌ 打印失败」，页面会同时列出可能原因和解决办法；按提示处理后重新提交。
+
+### 打印失败时页面会显示什么
+
+后端会把能识别到的打印机状态传成原因代码，前端展示中文原因和相应解决办法：
+
+| 可能原因 | 页面给出的处理办法 |
+| --- | --- |
+| 缺纸 | 打开纸盒放入 A4 纸，推回纸盒，按打印机“继续/开始”键，再重新打印 |
+| 卡纸 | 打开打印机盖/后盖，顺着走纸方向轻轻拉出，不要硬拽；关好盖再按“继续” |
+| 打印机离线 / 线松 | 检查电源、USB 线或 WiFi，到 Windows 设置确认默认打印机在线 |
+| 盖未关 / 缺墨 / 暂停 | 按对应提示关盖、换墨盒或在打印机/Windows 队列里点“继续” |
+| 其他驱动错误 | 看电脑上的打印队列或本程序控制台，处理后重新提交 |
+
+即使驱动不上报具体状态，页面也会列出缺纸、卡纸、离线三类最常见原因，不会只丢一句“失败”。
 
 ---
 

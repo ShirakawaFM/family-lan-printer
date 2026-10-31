@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1 — 2026-10-31
+
+### 新增
+
+- 打印失败反馈升级：显示具体可能原因（缺纸、卡纸、离线、盖未关、缺墨、暂停等）和对应解决办法。
+- 驱动不上报状态时，也会列出缺纸、卡纸、离线三类常见原因，不再只显示一句“打印失败”。
+
+### 修复
+
+- 修复 `requirements.txt` 被写入 NUL 字节导致 GitHub Actions 安装依赖失败的问题。
+- GitHub Actions 升级到 `actions/checkout@v5` / `actions/setup-python@v6`，消除 Node.js 20 弃用警告。
+
 ## 1.0.0 — 2026-10-26
 
 ### 新增
