@@ -2,17 +2,17 @@
 
 <img src="assets/banner.svg" alt="家庭内网打印：微信扫码，打印文字、照片和文件" width="100%" />
 
-# 家庭内网打印
-
 **让爸妈和孩子也会用的家庭打印工具。手机连上同一个 WiFi，微信扫码，输入密码，打字、选照片，或从手机/微信聊天记录里选文件，预览后一键打印。**
 
-[简体中文](README.md) · [English](README_EN.md)
+简体中文 · [English](README_EN.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.2-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-8B5CF6?style=flat-square&logo=github&logoColor=white)](CHANGELOG.md)
+[![CI](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml/badge.svg)](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
+[![Issues](https://img.shields.io/github/issues/ShirakawaFM/family-lan-printer?style=flat-square&color=F59E0B)](https://github.com/ShirakawaFM/family-lan-printer/issues)
 [![Stars](https://img.shields.io/github/stars/ShirakawaFM/family-lan-printer?style=social)](https://github.com/ShirakawaFM/family-lan-printer/stargazers)
 
 </div>
@@ -23,27 +23,69 @@
 
 ---
 
+## 三步跑起来
+
+<div align="center">
+<code>① 装依赖</code>&nbsp; → &nbsp;<code>② 改密码</code>&nbsp; → &nbsp;<code>③ 启动扫码打印</code>
+</div>
+
+```bat
+:: ① 装依赖（只需一次）
+python -m pip install -r requirements.txt
+
+:: ② 改密码：打开 print_server.py 顶部 ACCESS_PASSWORD
+::    把默认的 123456 换成家里自己的密码
+
+:: ③ 启动：控制台会打印二维码地址，并把 qr_wall.png 打印出来贴墙上
+python print_server.py
+```
+
+手机上没有 App、不用注册，也不用连外网：**连同一个 WiFi → 微信扫墙上的二维码 → 输入密码 → 打印。** 完整步骤见 [快速开始](#快速开始)。
+
+<div align="center">
+<a href="#快速开始">🚀 快速开始</a>&nbsp; · &nbsp;<a href="#页面预览">🖼️ 页面预览</a>&nbsp; · &nbsp;<a href="#配置项">🔧 配置项</a>&nbsp; · &nbsp;<a href="#安全设计">🛡️ 安全设计</a>&nbsp; · &nbsp;<a href="#常见问题-faq">❓ 常见问题</a>&nbsp; · &nbsp;<a href="README_EN.md">🌐 English</a>
+</div>
+
+---
+
+## 这版有什么不一样
+
+| ✨ 亮点 | 说明 |
+| :--- | :--- |
+| 🎨 **现代动态界面** | 深浅色双主题（跟随系统，右上角可手动切换）、渐变光晕背景、玻璃质感卡片、弹簧微动效与 Toast 轻提示 |
+| ⚡ **不到 1 秒启动** | 重型依赖按需加载、端口先绑定，首屏 gzip 后仅 ~4~16 KB，二次打开走 304 协商缓存 |
+| 🎬 **品牌启动动画** | 约 1 秒的品牌 Splash，资源就绪后模糊淡出；系统开启「减弱动态效果」时自动降级 |
+| 📱 **真的响应式** | 桌面双栏、手机单栏；手机上扫码卡压成横条，进页面就能直接看到输入框 |
+| 📊 **上传有反馈** | 真实上传进度条 + 文件预览骨架屏，不再是「点了没反应」 |
+| 👴 **仍然适老友好** | 正文不小于 16px、按钮通栏 56px 高、高对比配色，老人和小孩的触屏操作不受影响 |
+
+---
+
 ## 目录
 
-- [项目简介](#项目简介)
-- [页面预览](#页面预览)
-- [功能特性](#功能特性)
-- [工作原理](#工作原理)
-- [快速开始](#快速开始)
-- [使用流程](#使用流程)
-- [配置项](#配置项)
-- [打印规则](#打印规则)
-- [安全设计](#安全设计)
-- [公网部署包（傻瓜式）](#公网部署包傻瓜式)
-- [Windows 开机自启](#windows-开机自启)
-- [项目结构](#项目结构)
-- [性能与资源占用](#性能与资源占用)
-- [已知限制](#已知限制)
-- [常见问题 FAQ](#常见问题-faq)
-- [开发与测试](#开发与测试)
-- [贡献](#贡献)
-- [许可证](#许可证)
-- [免责声明](#免责声明)
+<details open>
+<summary><b>展开 / 收起（21 节）</b></summary>
+
+**开始之前**
+
+- [这版有什么不一样](#这版有什么不一样) · [三步跑起来](#三步跑起来)
+- [项目简介](#项目简介) · [页面预览](#页面预览) · [功能特性](#功能特性)
+
+**装和用**
+
+- [工作原理](#工作原理) · [快速开始](#快速开始) · [使用流程](#使用流程)
+- [打印规则](#打印规则) · [公网部署包（傻瓜式）](#公网部署包傻瓜式) · [Windows 开机自启](#windows-开机自启)
+
+**想知道更多**
+
+- [配置项](#配置项) · [安全设计](#安全设计) · [性能与资源占用](#性能与资源占用)
+- [项目结构](#项目结构) · [已知限制](#已知限制) · [常见问题 FAQ](#常见问题-faq)
+
+**维护**
+
+- [开发与测试](#开发与测试) · [贡献](#贡献) · [许可证](#许可证) · [免责声明](#免责声明)
+
+</details>
 
 ---
 
@@ -71,11 +113,43 @@
 
 ## 页面预览
 
-> 截图里的二维码是演示链接，不是真实可扫地址。
+### 桌面端 · 深色主题（默认跟随系统）
 
-| 密码页 | 打印主页（桌面端深色） | 打印主页（手机端浅色） |
-| :---: | :---: | :---: |
-| <img src="docs/screenshot-login.png" alt="输入使用密码" width="260" /> | <img src="docs/screenshot-print.png" alt="桌面端打印主页" width="420" /> | <img src="docs/screenshot-print-mobile.png" alt="手机端打印主页" width="230" /> |
+> 截图里的二维码是演示链接 `http://192.168.1.100:5000`，不是真实可扫地址。
+
+<div align="center">
+<a href="docs/screenshot-print.png"><img src="docs/screenshot-print.png" alt="桌面端打印主页（深色主题）" width="820" /></a>
+</div>
+
+<details>
+<summary><b>浅色主题 / 手机端 / 密码页 / 启动动画</b></summary>
+
+<br>
+
+<table>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-print-light.png"><img src="docs/screenshot-print-light.png" alt="桌面端打印主页（浅色主题）" width="100%" /></a>
+<br><sub><b>桌面端 · 浅色主题</b>：右上角可一键切换，跟随系统偏好自动记忆</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-splash.png"><img src="docs/screenshot-splash.png" alt="品牌启动动画" width="100%" /></a>
+<br><sub><b>品牌启动动画</b>：约 1 秒，资源就绪后模糊淡出</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-login.png"><img src="docs/screenshot-login.png" alt="手机密码页" width="60%" /></a>
+<br><sub><b>手机密码页</b>：全家共用一个密码，不是注册登录</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-print-mobile.png"><img src="docs/screenshot-print-mobile.png" alt="手机端打印主页" width="60%" /></a>
+<br><sub><b>手机打印主页</b>：扫码卡压成横条，进页面就能看到输入框</sub>
+</td>
+</tr>
+</table>
+
+</details>
 
 界面整体是现代动态风格：深浅色双主题（跟随系统，右上角可手动切换）、渐变光晕背景、玻璃质感卡片、弹簧动效；打开主页有约 1 秒的品牌启动动画，就绪后自动淡出。按钮仍然是大尺寸通栏设计（56px 高、16px 以上字号），老人和小孩的触屏操作不受影响。手机端扫码卡片压缩成横条，进页面就能直接看到输入框，不用先滑过二维码。文件先显示前 3 页预览，确认后再打印全部页面。
 
@@ -455,8 +529,12 @@ family-lan-printer/
 │  ├─ divider.svg                # 章节分隔线
 │  └─ footer.svg                 # 页脚签名
 ├─ docs/
-│  ├─ screenshot-login.png
-│  └─ screenshot-print.png
+│  ├─ screenshot-print.png          # 桌面端深色主页（README 主图）
+│  ├─ screenshot-print-light.png    # 桌面端浅色主页
+│  ├─ screenshot-print-mobile.png   # 手机端主页
+│  ├─ screenshot-login.png          # 手机端密码页
+│  ├─ screenshot-splash.png         # 品牌启动动画
+│  └─ social-preview.png            # GitHub 仓库社交分享图（在 Settings → Social preview 上传）
 ├─ deploy-public/                 # 公网部署包：填写单、脚本、HTTPS 教程
 │  ├─ 00-先看-公网部署教程.md
 │  ├─ 01-先填-部署信息.txt

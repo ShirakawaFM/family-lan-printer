@@ -2,21 +2,45 @@
 
 <img src="assets/banner-en.svg" alt="Family LAN Print: scan with WeChat, print text, photos and files" width="100%" />
 
-# Family LAN Print
-
 **A dead-simple home print server for Windows. Phones on the same Wi-Fi scan a QR code, enter a shared password, and print text, photos, or files from the phone / WeChat chat history.**
 
-[简体中文](README.md) · [English](README_EN.md)
+English · [简体中文](README.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.2-0B3D91?style=flat-square)](https://github.com/ShirakawaFM/family-lan-printer/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-8B5CF6?style=flat-square&logo=github&logoColor=white)](CHANGELOG.md)
+[![CI](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml/badge.svg)](https://github.com/ShirakawaFM/family-lan-printer/actions/workflows/python-check.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
+[![Issues](https://img.shields.io/github/issues/ShirakawaFM/family-lan-printer?style=flat-square&color=F59E0B)](https://github.com/ShirakawaFM/family-lan-printer/issues)
 [![Stars](https://img.shields.io/github/stars/ShirakawaFM/family-lan-printer?style=social)](https://github.com/ShirakawaFM/family-lan-printer/stargazers)
 
 </div>
 
 > This is **not** cloud printing. Text, images and files stay on your Windows PC and are deleted 30 seconds after each print job. Files that are only previewed are cleaned up after 30 minutes. No accounts, no telemetry, no ads.
+
+---
+
+## Three steps to run it
+
+<div align="center">
+<code>① install deps</code>&nbsp; → &nbsp;<code>② set the password</code>&nbsp; → &nbsp;<code>③ start &amp; scan</code>
+</div>
+
+```bat
+:: 1) deps (once)
+python -m pip install -r requirements.txt
+
+:: 2) open print_server.py and change ACCESS_PASSWORD (default: 123456)
+
+:: 3) start the server, print qr_wall.png and stick it next to the printer
+python print_server.py
+```
+
+No app, no sign-up, no internet needed: **join the same Wi-Fi → scan the QR with WeChat → enter the password → print.** Full walkthrough in [Quick start](#quick-start) below.
+
+<div align="center">
+<a href="#why">💡 Why</a>&nbsp; · &nbsp;<a href="#preview">🖼️ Preview</a>&nbsp; · &nbsp;<a href="#features">✨ Features</a>&nbsp; · &nbsp;<a href="#how-it-works">⚙️ How it works</a>&nbsp; · &nbsp;<a href="#configuration">🔧 Config</a>&nbsp; · &nbsp;<a href="#faq">❓ FAQ</a>&nbsp; · &nbsp;<a href="README.md">🇨🇳 中文</a>
+</div>
 
 ---
 
@@ -32,11 +56,43 @@ This project reduces it to:
 
 ## Preview
 
-> The QR code in the screenshots is a demo link, not a real address.
+### Desktop · dark theme (follows the system by default)
 
-| Password page | Print page (desktop, dark) | Print page (mobile, light) |
-| :---: | :---: | :---: |
-| <img src="docs/screenshot-login.png" alt="Password page" width="260" /> | <img src="docs/screenshot-print.png" alt="Desktop print page" width="420" /> | <img src="docs/screenshot-print-mobile.png" alt="Mobile print page" width="230" /> |
+> The QR code in the screenshots is a demo link (`http://192.168.1.100:5000`), not a real address.
+
+<div align="center">
+<a href="docs/screenshot-print.png"><img src="docs/screenshot-print.png" alt="Desktop print page (dark theme)" width="820" /></a>
+</div>
+
+<details>
+<summary><b>Light theme / mobile / password page / splash</b></summary>
+
+<br>
+
+<table>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-print-light.png"><img src="docs/screenshot-print-light.png" alt="Desktop print page (light theme)" width="100%" /></a>
+<br><sub><b>Desktop · light theme</b> — toggle in the top-right corner, follows the system preference</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-splash.png"><img src="docs/screenshot-splash.png" alt="Branded splash animation" width="100%" /></a>
+<br><sub><b>Branded splash</b> — ~1 s, fades out as soon as the page is ready</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+<a href="docs/screenshot-login.png"><img src="docs/screenshot-login.png" alt="Password page" width="60%" /></a>
+<br><sub><b>Password page</b> — one shared family password, no sign-up</sub>
+</td>
+<td align="center" width="50%">
+<a href="docs/screenshot-print-mobile.png"><img src="docs/screenshot-print-mobile.png" alt="Mobile print page" width="60%" /></a>
+<br><sub><b>Mobile print page</b> — the QR card collapses into a strip so the input is visible immediately</sub>
+</td>
+</tr>
+</table>
+
+</details>
 
 The UI uses a modern, motion-rich style: dark/light themes (follows the system, manual toggle included), gradient glow background, glassy cards, tabbed print modes and spring micro-interactions. A ~1 s branded splash animation plays on the print page and fades out as soon as the page is ready. Buttons stay large and full-width (56 px tall, 16 px+ font) so touch use by kids and grandparents is unaffected.
 
