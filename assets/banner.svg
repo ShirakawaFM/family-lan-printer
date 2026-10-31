@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="家庭内网打印：微信扫码，打印文字、照片和文件">
+  <title>家庭内网打印 · 微信扫码即可打印</title>
+  <defs>
+    <linearGradient id="pbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#061428"/>
+      <stop offset="0.55" stop-color="#08203C"/>
+      <stop offset="1" stop-color="#0A2A4A"/>
+    </linearGradient>
+    <radialGradient id="pglow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4C8DFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#4C8DFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="pglow2" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFC46B" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFC46B" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ptitle" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.6" stop-color="#E6F1FF"/>
+      <stop offset="1" stop-color="#7FB2FF"/>
+    </linearGradient>
+    <linearGradient id="pbar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9CC4FF"/>
+      <stop offset="1" stop-color="#2A5FA8"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DCE8F8"/>
+    </linearGradient>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#27507C"/>
+      <stop offset="1" stop-color="#122B49"/>
+    </linearGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="1.5" fill="#2B4E78"/>
+    </pattern>
+    <clipPath id="paperClip">
+      <rect x="0" y="0" width="1280" height="246"/>
+    </clipPath>
+    <clipPath id="phoneScreen">
+      <rect x="4" y="10" width="78" height="118" rx="6"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1280" height="420" fill="url(#pbg)"/>
+  <rect width="1280" height="420" fill="url(#dots)" opacity="0.45"/>
+  <rect width="1280" height="420" fill="url(#pglow)"/>
+  <circle cx="1040" cy="320" r="210" fill="url(#pglow2)"/>
+
+  <rect x="0" y="0" width="6" height="420" fill="url(#pbar)"/>
+  <rect x="0" y="0" width="6" height="420" fill="#CFE2FF" opacity="0.3">
+    <animate attributeName="opacity" values="0.08;0.6;0.08" dur="3.4s" repeatCount="indefinite"/>
+  </rect>
+
+  <text x="74" y="88" fill="#7FB2FF" font-family="Consolas, 'Courier New', monospace" font-size="17" letter-spacing="4.5">SHIRAKAWAFM / FAMILY LAN PRINT</text>
+
+  <text y="196" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif" font-size="74" font-weight="800">
+    <tspan x="72" fill="url(#ptitle)">家庭内网打印</tspan>
+  </text>
+
+  <text x="74" y="246" fill="#E8F2FF" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="27" font-weight="700">微信扫一扫，打印机自己开始干活</text>
+  <text x="74" y="284" fill="#8FA9C9" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="18">不装 App、不注册账号、不上传云端：手机连家里 WiFi，扫码就能打文字、照片和文件</text>
+
+  <g font-family="'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="700">
+    <g>
+      <rect x="72" y="322" width="104" height="38" rx="19" fill="#0E2C4E" stroke="#2C5F9E"/>
+      <text x="94" y="347" fill="#CFE0FF">Windows</text>
+    </g>
+    <g>
+      <rect x="188" y="322" width="140" height="38" rx="19" fill="#0E2C4E" stroke="#2C5F9E"/>
+      <text x="210" y="347" fill="#CFE0FF">单文件 Python</text>
+    </g>
+    <g>
+      <rect x="340" y="322" width="128" height="38" rx="19" fill="#0E2C4E" stroke="#2C5F9E"/>
+      <text x="362" y="347" fill="#CFE0FF">PDF / Office</text>
+    </g>
+    <g>
+      <rect x="480" y="322" width="130" height="38" rx="19" fill="#0E2C4E" stroke="#2C5F9E"/>
+      <text x="502" y="347" fill="#CFE0FF">A4 宋体 24</text>
+    </g>
+    <g>
+      <rect x="622" y="322" width="124" height="38" rx="19" fill="#0E2C4E" stroke="#2C5F9E"/>
+      <text x="644" y="347" fill="#CFE0FF">串行队列</text>
+    </g>
+  </g>
+
+  <g transform="translate(772 68)">
+    <rect x="0" y="0" width="86" height="140" rx="14" fill="#0C2138" stroke="#35618F" stroke-width="2"/>
+    <rect x="4" y="10" width="78" height="118" rx="6" fill="#F2F7FF"/>
+    <g clip-path="url(#phoneScreen)">
+      <rect x="4" y="10" width="78" height="118" fill="#F2F7FF"/>
+      <g fill="#0B2340">
+        <rect x="14" y="20" width="18" height="18" rx="2"/><rect x="18.5" y="24.5" width="9" height="9" fill="#F2F7FF"/>
+        <rect x="54" y="20" width="18" height="18" rx="2"/><rect x="58.5" y="24.5" width="9" height="9" fill="#F2F7FF"/>
+        <rect x="14" y="64" width="18" height="18" rx="2"/><rect x="18.5" y="68.5" width="9" height="9" fill="#F2F7FF"/>
+        <rect x="37" y="20" width="5" height="5"/><rect x="45" y="27" width="5" height="5"/>
+        <rect x="37" y="38" width="5" height="5"/><rect x="45" y="46" width="5" height="5"/>
+        <rect x="55" y="50" width="5" height="5"/><rect x="64" y="44" width="5" height="5"/>
+        <rect x="37" y="66" width="5" height="5"/><rect x="47" y="74" width="5" height="5"/>
+        <rect x="57" y="66" width="5" height="5"/><rect x="66" y="76" width="5" height="5"/>
+        <rect x="37" y="96" width="5" height="5"/><rect x="47" y="106" width="5" height="5"/>
+        <rect x="57" y="96" width="5" height="5"/><rect x="67" y="106" width="5" height="5"/>
+      </g>
+      <rect x="4" y="10" width="78" height="3" fill="#2BE8C4">
+        <animate attributeName="y" values="10;125;10" dur="3.2s" repeatCount="indefinite"/>
+      </rect>
+    </g>
+    <rect x="34" y="132" width="18" height="3" rx="1.5" fill="#7FA3CB"/>
+    <text x="43" y="158" text-anchor="middle" fill="#9FC0E8" font-family="'PingFang SC', sans-serif" font-size="12">微信扫码</text>
+  </g>
+
+  <path d="M868 150 C900 168 906 210 918 246" fill="none" stroke="#4C8DFF" stroke-width="2" stroke-dasharray="6 7" opacity="0.65">
+    <animate attributeName="stroke-dashoffset" values="0;-52" dur="2.4s" repeatCount="indefinite"/>
+  </path>
+
+  <g clip-path="url(#paperClip)">
+    <rect x="934" y="132" width="226" height="122" rx="6" fill="url(#paper)" stroke="#C7D8EC">
+      <animateTransform attributeName="transform" type="translate" values="0 0;0 -16;0 -16;0 0" keyTimes="0;0.42;0.78;1" dur="7s" repeatCount="indefinite"/>
+    </rect>
+    <g fill="#9DB0C6">
+      <rect x="954" y="156" width="132" height="7" rx="3.5">
+        <animateTransform attributeName="transform" type="translate" values="0 0;0 -16;0 -16;0 0" keyTimes="0;0.42;0.78;1" dur="7s" repeatCount="indefinite"/>
+      </rect>
+      <rect x="954" y="174" width="186" height="7" rx="3.5">
+        <animateTransform attributeName="transform" type="translate" values="0 0;0 -16;0 -16;0 0" keyTimes="0;0.42;0.78;1" dur="7s" repeatCount="indefinite"/>
+      </rect>
+      <rect x="954" y="192" width="160" height="7" rx="3.5">
+        <animateTransform attributeName="transform" type="translate" values="0 0;0 -16;0 -16;0 0" keyTimes="0;0.42;0.78;1" dur="7s" repeatCount="indefinite"/>
+      </rect>
+      <rect x="954" y="210" width="112" height="7" rx="3.5" opacity="0.7">
+        <animateTransform attributeName="transform" type="translate" values="0 0;0 -16;0 -16;0 0" keyTimes="0;0.42;0.78;1" dur="7s" repeatCount="indefinite"/>
+      </rect>
+    </g>
+  </g>
+
+  <g>
+    <rect x="900" y="248" width="310" height="104" rx="16" fill="url(#bodyGrad)" stroke="#3A6A9C" stroke-width="1.5"/>
+    <rect x="900" y="248" width="310" height="16" rx="8" fill="#2E5686" opacity="0.85"/>
+    <rect x="928" y="242" width="252" height="10" rx="5" fill="#08172A"/>
+    <rect x="922" y="278" width="112" height="40" rx="6" fill="#0A1829" stroke="#2F5480"/>
+    <text x="934" y="304" fill="#2BE8C4" font-family="Consolas, monospace" font-size="13">PRINTING</text>
+    <circle cx="924" cy="304" r="3" fill="#2BE8C4">
+      <animate attributeName="opacity" values="1;0.2;1" dur="1.4s" repeatCount="indefinite"/>
+    </circle>
+    <g fill="#4C8DFF" opacity="0.85">
+      <rect x="1092" y="292" width="6" height="14" rx="3"/>
+      <rect x="1104" y="284" width="6" height="30" rx="3"/>
+      <rect x="1116" y="296" width="6" height="8" rx="3"/>
+    </g>
+    <circle cx="1172" cy="300" r="6" fill="#FFC46B">
+      <animate attributeName="opacity" values="1;0.25;1" dur="1.8s" repeatCount="indefinite"/>
+    </circle>
+    <text x="922" y="340" fill="#7FA3CB" font-family="Consolas, monospace" font-size="11">A4 · 300 DPI · SERIAL QUEUE</text>
+  </g>
+
+  <text x="74" y="394" fill="#4C6E93" font-family="Consolas, 'Courier New', monospace" font-size="15">MIT · Windows 10/11 · Flask + pywin32 · github.com/ShirakawaFM/family-lan-printer</text>
+</svg>

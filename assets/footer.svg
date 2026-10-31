@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="150" viewBox="0 0 1280 150" role="img" aria-label="家庭内网打印 · MIT © ShirakawaFM / 白川方明">
+  <defs>
+    <linearGradient id="fbg3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#061428"/>
+      <stop offset="0.5" stop-color="#08213D"/>
+      <stop offset="1" stop-color="#0A2542"/>
+    </linearGradient>
+    <linearGradient id="sig3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#7FB2FF"/>
+    </linearGradient>
+    <linearGradient id="hair3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4C8DFF" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#4C8DFF" stop-opacity="0.65"/>
+      <stop offset="1" stop-color="#4C8DFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="shim3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#EAF3FF" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="150" fill="url(#fbg3)"/>
+  <rect x="0" y="0" width="1280" height="1.5" fill="url(#hair3)"/>
+
+  <text x="64" y="86" fill="url(#sig3)" font-family="Georgia, 'Times New Roman', 'Songti SC', serif" font-size="46" font-style="italic">ShirakawaFM</text>
+  <g opacity="0.75">
+    <rect x="-120" y="50" width="120" height="46" fill="url(#shim3)">
+      <animate attributeName="x" values="-120;520" dur="5.4s" begin="0.8s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+
+  <text x="64" y="116" fill="#6E8FB4" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="15">白川方明 · 把家里那台打印机变成全家人的打印机</text>
+
+  <path d="M64 98 C160 108 300 92 420 100" fill="none" stroke="#4C8DFF" stroke-width="2" stroke-linecap="round" opacity="0.7">
+    <animate attributeName="opacity" values="0.35;0.9;0.35" dur="4s" repeatCount="indefinite"/>
+  </path>
+
+  <g font-family="Consolas, 'Courier New', monospace" font-size="14" fill="#4C6E93">
+    <text x="64" y="140">MIT LICENSED · 2026</text>
+    <text x="1216" y="140" text-anchor="end" fill="#5F87B5">github.com/ShirakawaFM/family-lan-printer</text>
+  </g>
+
+  <g transform="translate(770 58)" fill="none" stroke="#7FB2FF" stroke-width="1.6" opacity="0.75">
+    <rect x="0" y="0" width="120" height="34" rx="6"/>
+    <path d="M14 0 v-10 h92 v10"/>
+    <circle cx="16" cy="17" r="3" fill="#FFC46B" stroke="none">
+      <animate attributeName="opacity" values="1;0.25;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <path d="M32 17 h48" stroke-dasharray="4 4">
+      <animate attributeName="stroke-dashoffset" values="0;-32" dur="2s" repeatCount="indefinite"/>
+    </path>
+    <rect x="92" y="12" width="8" height="10" rx="2"/>
+  </g>
+  <circle cx="1150" cy="75" r="3" fill="#2BE8C4">
+    <animate attributeName="r" values="2;4;2" dur="2s" repeatCount="indefinite"/>
+  </circle>
+</svg>
