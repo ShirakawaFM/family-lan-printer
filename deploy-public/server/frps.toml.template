@@ -1,0 +1,15 @@
+# frps.toml 模板
+# 把所有 （） 内容替换成真实值，删除括号。
+# 保存到 /opt/frp/frps.toml，然后运行：
+#   /opt/frp/frps -c /opt/frp/frps.toml
+
+bindPort = （frp 控制端口，默认 7000）
+auth.method = "token"
+auth.token = "（frp token，建议 32 位以上随机字符）"
+
+log.to = "/opt/frp/frps.log"
+log.level = "info"
+log.maxDays = 7
+
+# 可选：上 HTTPS 时，让外网端口只监听本机，由 Caddy/Nginx 反代。
+# proxyBindAddr = "127.0.0.1"
