@@ -20,6 +20,19 @@ English · [简体中文](README.md)
 
 ---
 
+## Which download?
+
+The release has two packages:
+
+| Version | Best for | Download |
+| --- | --- | --- |
+| **LAN version** | Same Wi-Fi only; simplest, no VPS | [family-lan-printer-lan-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-lan-v1.2.0.zip) |
+| **Public deployment version** | 4G/5G access; needs a VPS | [family-lan-printer-public-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-public-v1.2.0.zip) |
+
+Both include `print_server.py`, dependencies, README and screenshots. The public package also includes `deploy-public/` with fill-in sheets, frps/frpc scripts and an optional HTTPS guide.
+
+---
+
 ## Three steps to run it
 
 <div align="center">

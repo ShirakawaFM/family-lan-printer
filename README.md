@@ -23,6 +23,21 @@
 
 ---
 
+## 下载哪个版本
+
+Release 提供两个压缩包，按需要选一个即可：
+
+| 版本 | 适合谁 | 下载 |
+| --- | --- | --- |
+| **LAN 局域网版** | 只在家里同一个 WiFi 下用，最简单，不需要云服务器 | [family-lan-printer-lan-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-lan-v1.2.0.zip) |
+| **公网部署版** | 需要在外面用 4G/5G 访问，需要一台云服务器 | [family-lan-printer-public-v1.2.0.zip](https://github.com/ShirakawaFM/family-lan-printer/releases/download/v1.2.0/family-lan-printer-public-v1.2.0.zip) |
+
+两个包都包含完整的 `print_server.py`、依赖清单、README 和截图。公网部署版额外包含 `deploy-public/`：填写单、frps/frpc 一键脚本和 HTTPS 教程。
+
+> 不确定就选 **LAN 局域网版**。公网版涉及云服务器、安全组和 frp，按包里的教程操作。
+
+---
+
 ## 三步跑起来
 
 <div align="center">
@@ -67,11 +82,11 @@ python print_server.py
 ## 目录
 
 <details open>
-<summary><b>展开 / 收起（24 节）</b></summary>
+<summary><b>展开 / 收起（25 节）</b></summary>
 
 **开始之前**
 
-- [这版有什么不一样](#这版有什么不一样) · [三步跑起来](#三步跑起来)
+- [下载哪个版本](#下载哪个版本) · [这版有什么不一样](#这版有什么不一样) · [三步跑起来](#三步跑起来)
 - [项目简介](#项目简介) · [页面预览](#页面预览) · [功能特性](#功能特性)
 
 **装和用**
