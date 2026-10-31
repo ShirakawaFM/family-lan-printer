@@ -16,8 +16,12 @@
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
 import hmac
 import html as html_lib
+import importlib
+import importlib.util
 import io
 import ipaddress
 import json
@@ -111,32 +115,52 @@ if sys.version_info < (3, 9):
     print("Python 版本太旧，请安装 Python 3.10 或更高版本后再运行。")
     raise SystemExit(1)
 
-try:
-    import pypdfium2 as pdfium
-    import pythoncom
-    import qrcode
-    import win32com.client as win32
-    import win32con
-    import win32print
-    import win32ui
-    from flask import (
-        Flask,
-        jsonify,
-        redirect,
-        render_template_string,
-        request,
-        session,
-        url_for,
-    )
-    from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageWin
-    from werkzeug.exceptions import HTTPException
-except ImportError as exc:
-    missing = getattr(exc, "name", "") or "所需依赖"
-    print("缺少运行依赖：" + str(missing))
+# 依赖检查用 find_spec（只查存在、不真正加载），PDF 和 Office COM 这类大块头
+# 改成打印时按需加载，能明显缩短从双击运行到“可以扫码”的等待时间。
+_REQUIRED_MODULES = (
+    "flask", "PIL", "qrcode", "werkzeug",
+    "pypdfium2", "win32print", "win32ui", "win32con", "win32com", "pythoncom",
+)
+_missing = [name for name in _REQUIRED_MODULES if importlib.util.find_spec(name) is None]
+if _missing:
+    print("缺少运行依赖：" + "、".join(_missing))
     print("请在命令行执行：")
     print('pip install -i https://mirrors.aliyun.com/pypi/simple/ Flask "pywin32>=306" "Pillow>=10.0" "qrcode[pil]>=7.4" "pypdfium2>=4.0"')
     print("也可以执行：pip install -r requirements.txt")
     raise SystemExit(1)
+
+# 启动关键路径只导入必需的库。
+import flask  # noqa: E402
+from flask import (  # noqa: E402
+    Flask,
+    jsonify,
+    redirect,
+    request,
+    session,
+    url_for,
+)
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageWin  # noqa: E402
+import qrcode  # noqa: E402
+import win32con  # noqa: E402
+import win32print  # noqa: E402
+from werkzeug.exceptions import HTTPException  # noqa: E402
+from werkzeug.serving import make_server  # noqa: E402
+
+# 懒加载登记表：变量名 -> 模块名。首次使用时才真正 import。
+_LAZY_MODULES = {
+    "pdfium": "pypdfium2",
+    "pythoncom": "pythoncom",
+    "win32": "win32com.client",
+    "win32ui": "win32ui",
+}
+
+
+def _lazy_import(global_name: str):
+    """按需加载大模块，加载一次后写回全局变量。"""
+
+    module = importlib.import_module(_LAZY_MODULES[global_name])
+    globals()[global_name] = module
+    return module
 
 # 程序目录：二维码和 temp_print 都放在这里，和当前命令行所在目录无关。
 BASE_DIR = Path(__file__).resolve().parent
@@ -153,8 +177,9 @@ if sys.stderr is None:
 # 运行时由 main() 填写。
 LAN_IP = ""
 LAN_URL = ""
-QR_PNG_BYTES = b""
-QR_DATA_URI = ""
+QR_PNG_BYTES = b""  # 贴墙用 300 DPI 高清二维码（后台生成，不阻塞启动）
+WEB_QR_PNG_BYTES = b""  # 网页展示用的小尺寸二维码（启动关键路径，几毫秒）
+WEB_QR_ETAG = ""
 
 # 控制台日志。前端永远看不到这里的错误堆栈。
 logging.basicConfig(
@@ -269,12 +294,12 @@ def detect_lan_ip() -> str:
     return unique[0] if unique else "127.0.0.1"
 
 
-def build_qr_png(data: str) -> bytes:
-    """生成高分辨率黑白二维码 PNG，适合直接打印贴墙。"""
+def build_qr_png(data: str, box_size: int = 32) -> bytes:
+    """生成黑白二维码 PNG。box_size 越大图越高清，编码也越慢。"""
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=32,
+        box_size=box_size,
         border=4,
     )
     qr.add_data(data)
@@ -285,8 +310,11 @@ def build_qr_png(data: str) -> bytes:
     image = image.convert("RGB")
 
     buffer = io.BytesIO()
-    # 300 DPI 的 PNG，打印出来边缘清晰，微信也容易识别。
-    image.save(buffer, format="PNG", dpi=(300, 300))
+    if box_size >= 32:
+        # 300 DPI 的 PNG，打印出来边缘清晰，微信也容易识别。
+        image.save(buffer, format="PNG", dpi=(300, 300))
+    else:
+        image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
@@ -600,6 +628,7 @@ def _render_pdf_page(pdf, page_index: int, dpi: int) -> Image.Image:
 
 def _pdf_preview(pdf_path: Path):
     """返回 (总页数, 前几页预览 data URI)。"""
+    pdfium = _lazy_import("pdfium")
     try:
         pdf = pdfium.PdfDocument(str(pdf_path))
     except Exception as exc:
@@ -622,6 +651,7 @@ def _pdf_preview(pdf_path: Path):
 
 
 def _iter_pdf_page_images(pdf_path: Path) -> Iterator[Image.Image]:
+    pdfium = _lazy_import("pdfium")
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
         if len(pdf) <= 0:
@@ -655,7 +685,8 @@ def _ppt_to_images(source: Path, work_dir: Path) -> Path:
     slides_dir = work_dir / "slides"
     slides_dir.mkdir(parents=True, exist_ok=False)
     with _OFFICE_LOCK:
-        pythoncom.CoInitialize()
+        _lazy_import("pythoncom").CoInitialize()
+        _lazy_import("win32")
         app = None
         presentation = None
         try:
@@ -718,7 +749,8 @@ def _office_to_pdf(source: Path, target: Path, extension: str) -> None:
     没有安装 Office 时给前端返回统一中文提示。
     """
     with _OFFICE_LOCK:
-        pythoncom.CoInitialize()
+        _lazy_import("pythoncom").CoInitialize()
+        _lazy_import("win32")
         app = None
         document = None
         try:
@@ -1076,6 +1108,7 @@ def _print_page_images(images: Iterable[Image.Image], job_name: str) -> None:
     """
     printer_name = _get_ready_printer()
 
+    _lazy_import("win32ui")
     hdc = win32ui.CreateDC()
     try:
         hdc.CreatePrinterDC(printer_name)
@@ -1262,79 +1295,261 @@ except Exception:
     pass
 
 
+@lru_cache(maxsize=4)
+def _compiled_template(source: str):
+    """预编译 Jinja 模板：页面 HTML 只在首次访问时解析一次。"""
+
+    return app.jinja_env.from_string(source)
+
+
 UNLOCK_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>家庭打印</title>
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#060911">
+<title>家庭打印 · 输入密码</title>
+<script>(function(){try{var t=localStorage.getItem("fp-theme");document.documentElement.setAttribute("data-theme",(t==="light"||t==="dark")?t:(window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
 <style>
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { background: #ffffff; color: #111111; color-scheme: light; }
-  body {
-    margin: 0 auto;
-    padding: 24px 18px 32px;
-    padding-bottom: calc(32px + env(safe-area-inset-bottom));
-    max-width: 640px;
-    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
-    font-size: 22px;
-    line-height: 1.55;
-    -webkit-text-size-adjust: 100%;
-  }
-  h1 { font-size: 32px; margin: 8px 0 24px; text-align: center; }
-  .tip { font-size: 24px; font-weight: 800; text-align: center; margin: 0 0 26px; }
-  label { display: block; font-size: 24px; font-weight: 800; margin-bottom: 10px; }
-  input[type="password"] {
-    width: 100%;
-    min-height: 68px;
-    padding: 12px 14px;
-    font-size: 28px;
-    letter-spacing: 2px;
-    color: #111111;
-    background: #ffffff;
-    border: 3px solid #111111;
-    border-radius: 8px;
-  }
-  button {
-    width: 100%;
-    min-height: 78px;
-    margin-top: 20px;
-    padding: 12px;
-    background: #0B3D91;
-    color: #ffffff;
-    border: 3px solid #0B3D91;
-    border-radius: 10px;
-    font-family: inherit;
-    font-size: 28px;
-    font-weight: 900;
-    letter-spacing: 1px;
-  }
-  button:active { background: #082a66; }
-  .error {
-    margin-top: 20px;
-    padding: 14px;
-    background: #FDECEA;
-    border: 3px solid #B71C1C;
-    border-radius: 8px;
-    color: #8B0000;
-    font-size: 24px;
-    font-weight: 800;
-  }
-  .hint { margin: 24px 0 0; font-size: 22px; color: #222222; text-align: center; }
+:root{
+  --bg:#060911;
+  --surface:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.03));
+  --surface-2:rgba(255,255,255,.055);
+  --surface-flat:rgba(255,255,255,.04);
+  --line:rgba(255,255,255,.10);
+  --line-2:rgba(255,255,255,.18);
+  --text:#EAF0FA;
+  --muted:#98A5BA;
+  --faint:#6B7789;
+  --text-dim:rgba(234,240,250,.48);
+  --accent:#6C8CFF;
+  --grad:linear-gradient(135deg,#5B7CFF 0%,#8B6DFF 55%,#B06CFF 100%);
+  --bad:#FB7185;
+  --bad-bg:rgba(251,113,133,.10);
+  --bad-line:rgba(251,113,133,.34);
+  --ring:rgba(108,140,255,.55);
+  --shadow:0 40px 90px -40px rgba(0,0,0,.95);
+  --ease:cubic-bezier(.16,1,.3,1);
+  --spring:cubic-bezier(.22,1.2,.36,1);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#F3F5FA;
+  --surface:linear-gradient(180deg,rgba(255,255,255,.98),rgba(255,255,255,.90));
+  --surface-2:rgba(15,23,42,.045);
+  --surface-flat:#fff;
+  --line:rgba(15,23,42,.10);
+  --line-2:rgba(15,23,42,.18);
+  --text:#0B1220;
+  --muted:#55617A;
+  --faint:#7C879B;
+  --text-dim:rgba(11,18,32,.50);
+  --accent:#3D5CE5;
+  --grad:linear-gradient(135deg,#4361EE 0%,#6C4BE8 55%,#8B4BE8 100%);
+  --bad:#D93A52;
+  --bad-bg:rgba(217,58,82,.08);
+  --bad-line:rgba(217,58,82,.28);
+  --ring:rgba(67,97,238,.40);
+  --shadow:0 40px 80px -44px rgba(15,23,42,.40);
+  color-scheme:light;
+}
+*,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{background:var(--bg)}
+body{
+  margin:0;min-height:100dvh;display:grid;place-items:center;
+  padding:24px 18px calc(24px + env(safe-area-inset-bottom));
+  color:var(--text);
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:16px;line-height:1.6;-webkit-text-size-adjust:100%;overflow-x:hidden;
+}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+h1,p{margin:0}
+
+.aurora{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.aurora span{position:absolute;border-radius:50%;will-change:transform;transform:translateZ(0)}
+.aurora .g1{width:130vw;height:130vw;left:-46vw;top:-62vw;background:radial-gradient(circle,rgba(91,124,255,.34) 0%,rgba(91,124,255,0) 62%);animation:drift1 30s var(--ease) infinite alternate}
+.aurora .g2{width:110vw;height:110vw;right:-40vw;bottom:-40vw;background:radial-gradient(circle,rgba(155,123,255,.28) 0%,rgba(155,123,255,0) 60%);animation:drift2 34s var(--ease) infinite alternate}
+:root[data-theme="light"] .aurora span{opacity:.55}
+@keyframes drift1{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(6vw,5vw,0) scale(1.08)}}
+@keyframes drift2{from{transform:translate3d(0,0,0) scale(1.06)}to{transform:translate3d(-6vw,-5vw,0) scale(1)}}
+@keyframes riseIn{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes shake{0%,100%{transform:translateX(0)}20%{transform:translateX(-6px)}40%{transform:translateX(5px)}60%{transform:translateX(-3px)}80%{transform:translateX(2px)}}
+
+.wrap{position:relative;z-index:1;width:100%;max-width:420px}
+.theme-fab{position:fixed;top:16px;right:16px;z-index:5;width:36px;height:36px;border-radius:11px;display:grid;place-items:center;
+  background:var(--surface-flat);border:1px solid var(--line);color:var(--muted);
+  transition:transform .22s var(--spring),color .2s,border-color .2s}
+.theme-fab:hover{color:var(--text);border-color:var(--line-2)}
+.theme-fab:active{transform:scale(.92)}
+.theme-fab svg{width:17px;height:17px}
+.theme-fab .moon{display:none}
+:root[data-theme="light"] .theme-fab .sun{display:none}
+:root[data-theme="light"] .theme-fab .moon{display:block}
+
+.card{
+  position:relative;padding:32px 26px 28px;border-radius:26px;
+  background:var(--surface);border:1px solid var(--line);
+  box-shadow:var(--shadow);
+  -webkit-backdrop-filter:blur(18px) saturate(150%);
+  backdrop-filter:blur(18px) saturate(150%);
+  animation:riseIn .62s var(--ease) both;
+}
+.card::before{
+  content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(180deg,rgba(255,255,255,.10),transparent 40%);opacity:.7;
+}
+.mark{
+  width:60px;height:60px;border-radius:19px;display:grid;place-items:center;margin:0 auto;
+  background:var(--grad);
+  box-shadow:0 20px 40px -20px rgba(108,140,255,.95),inset 0 1px 0 rgba(255,255,255,.38);
+  animation:riseIn .7s var(--spring) .06s both;
+}
+.mark svg{width:29px;height:29px;color:#fff}
+h1{margin-top:20px;font-size:23px;font-weight:800;letter-spacing:.02em;text-align:center;animation:riseIn .6s var(--ease) .12s both}
+.sub{margin-top:7px;font-size:13.5px;color:var(--muted);text-align:center;line-height:1.6;animation:riseIn .6s var(--ease) .16s both}
+
+form{margin-top:24px;animation:riseIn .6s var(--ease) .2s both}
+.label{display:block;margin-bottom:8px;font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.03em}
+.field{position:relative}
+input[type="password"],input[type="text"]{
+  display:block;width:100%;height:56px;padding:0 52px 0 15px;
+  color:var(--text);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:14px;
+  font-family:inherit;font-size:19px;letter-spacing:.14em;
+  transition:border-color .2s,box-shadow .2s,background .2s;
+}
+input::placeholder{color:var(--faint);letter-spacing:.02em}
+input:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--ring);background:transparent}
+.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:42px;height:42px;border-radius:11px;display:grid;place-items:center;color:var(--faint)}
+.eye:hover{color:var(--text);background:var(--surface-2)}
+.eye svg{width:18px;height:18px}
+
+.btn{
+  position:relative;display:flex;align-items:center;justify-content:center;gap:9px;
+  width:100%;height:56px;margin-top:16px;border-radius:14px;overflow:hidden;isolation:isolate;
+  font-size:16.5px;font-weight:800;letter-spacing:.03em;color:#fff;background:var(--grad);
+  box-shadow:0 18px 36px -20px rgba(108,140,255,.95),inset 0 1px 0 rgba(255,255,255,.28);
+  transition:transform .22s var(--spring),box-shadow .24s;
+}
+.btn::after{
+  content:"";position:absolute;inset:0;z-index:-1;
+  background:linear-gradient(100deg,transparent 20%,rgba(255,255,255,.30) 48%,transparent 72%);
+  transform:translateX(-120%);transition:transform .7s var(--ease);
+}
+.btn:hover::after{transform:translateX(120%)}
+.btn:active{transform:scale(.978)}
+.btn .spin{width:16px;height:16px;border-radius:50%;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:spin .7s linear infinite;display:none}
+.btn.is-busy .spin{display:block}
+.btn:focus-visible{outline:2px solid var(--ring);outline-offset:3px}
+
+.error{
+  display:flex;align-items:flex-start;gap:9px;margin-top:14px;padding:12px 13px;border-radius:13px;
+  color:var(--bad);background:var(--bad-bg);border:1px solid var(--bad-line);
+  font-size:14px;font-weight:700;line-height:1.5;
+  animation:shake .5s var(--ease) .08s both;
+}
+.error svg{width:16px;height:16px;flex:0 0 auto;margin-top:2px}
+.hint{margin-top:22px;font-size:12.5px;color:var(--faint);text-align:center;line-height:1.7;animation:riseIn .6s var(--ease) .26s both}
+.hint b{color:var(--muted);font-weight:700}
+@media (max-width:380px){
+  .card{padding:26px 20px 24px;border-radius:22px}
+  h1{font-size:21px}
+}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
+}
 </style>
 </head>
 <body>
-  <h1>家庭打印</h1>
-  <p class="tip">请输入使用密码，再开始打印</p>
-  <form method="post" action="{{ url_for('unlock') }}">
-    <label for="password">使用密码</label>
-    <input id="password" name="password" type="password" inputmode="text"
-           autocomplete="current-password" autocapitalize="off" autocorrect="off"
-           spellcheck="false" autofocus>
-    <button type="submit">进入打印页面</button>
-  </form>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  <p class="hint">密码可以问家里的年轻人</p>
+<div class="aurora" aria-hidden="true"><span class="g1"></span><span class="g2"></span></div>
+
+<button class="theme-fab" id="themeToggle" type="button" aria-label="切换深浅色">
+  <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+  <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8z"/></svg>
+</button>
+
+<div class="wrap">
+  <div class="card">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/>
+      </svg>
+    </div>
+    <h1>家庭打印</h1>
+    <p class="sub">输入使用密码，连接家里的打印机</p>
+
+    <form method="post" action="{{ url_for('unlock') }}" id="unlockForm">
+      <label class="label" for="password">使用密码</label>
+      <div class="field">
+        <input id="password" name="password" type="password" inputmode="text"
+               autocomplete="current-password" autocapitalize="off" autocorrect="off"
+               spellcheck="false" placeholder="请输入密码" autofocus required>
+        <button class="eye" id="eye" type="button" aria-label="显示密码">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></svg>
+        </button>
+      </div>
+      {% if error %}
+      <div class="error" role="alert">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/></svg>
+        <span>{{ error }}</span>
+      </div>
+      {% endif %}
+      <button class="btn" type="submit" id="submitBtn">
+        <span class="spin" aria-hidden="true"></span>
+        <span class="lbl">进入打印页面</span>
+      </button>
+    </form>
+
+    <p class="hint">忘记密码？问家里帮您设置这台电脑的人</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  var btn = document.getElementById("themeToggle");
+  function cur() { return root.getAttribute("data-theme") === "light" ? "light" : "dark"; }
+  function syncMeta() {
+    var m = document.querySelector('meta[name="theme-color"]');
+    if (m) { m.setAttribute("content", cur() === "light" ? "#F3F5FA" : "#060911"); }
+  }
+  syncMeta();
+  if (btn) {
+    btn.addEventListener("click", function () {
+      var next = cur() === "light" ? "dark" : "light";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("fp-theme", next); } catch (e) {}
+      syncMeta();
+    });
+  }
+
+  var input = document.getElementById("password");
+  var eye = document.getElementById("eye");
+  if (eye && input) {
+    eye.addEventListener("click", function () {
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      eye.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+      input.focus();
+    });
+  }
+
+  var form = document.getElementById("unlockForm");
+  var submit = document.getElementById("submitBtn");
+  if (form && submit) {
+    form.addEventListener("submit", function () {
+      if (!input.value) { return; }
+      submit.classList.add("is-busy");
+      var lbl = submit.querySelector(".lbl");
+      if (lbl) { lbl.textContent = "正在验证…"; }
+      submit.disabled = true;
+    });
+  }
+})();
+</script>
 </body>
 </html>
 """
@@ -1345,232 +1560,788 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#060911">
 <title>家庭打印</title>
+<script>(function(){try{var t=localStorage.getItem("fp-theme");document.documentElement.setAttribute("data-theme",(t==="light"||t==="dark")?t:(window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
 <style>
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { background: #ffffff; color: #111111; color-scheme: light; }
-  body {
-    margin: 0 auto;
-    padding: 18px 16px 30px;
-    padding-bottom: calc(30px + env(safe-area-inset-bottom));
-    max-width: 640px;
-    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
-    font-size: 22px;
-    line-height: 1.55;
-    -webkit-text-size-adjust: 100%;
-  }
-  .tip {
-    margin: 0 0 18px;
-    font-size: 24px;
-    font-weight: 800;
-    line-height: 1.5;
-    text-align: center;
-  }
-  .qr-wrap { margin: 0 0 24px; text-align: center; }
-  .qr-wrap img {
-    display: block;
-    width: 72vw;
-    max-width: 320px;
-    height: auto;
-    margin: 0 auto;
-    padding: 8px;
-    background: #ffffff;
-    border: 2px solid #D0D0D0;
-    image-rendering: pixelated;
-  }
-  section {
-    margin-top: 24px;
-    padding-top: 20px;
-    border-top: 3px solid #111111;
-  }
-  label { display: block; font-size: 24px; font-weight: 800; margin-bottom: 12px; }
-  textarea {
-    display: block;
-    width: 100%;
-    min-height: 210px;
-    padding: 14px;
-    color: #111111;
-    background: #ffffff;
-    border: 3px solid #111111;
-    border-radius: 8px;
-    font-family: inherit;
-    font-size: 24px;
-    line-height: 1.55;
-    resize: vertical;
-  }
-  button {
-    width: 100%;
-    min-height: 80px;
-    margin-top: 18px;
-    padding: 12px;
-    background: #0B3D91;
-    color: #ffffff;
-    border: 3px solid #0B3D91;
-    border-radius: 10px;
-    font-family: inherit;
-    font-size: 30px;
-    font-weight: 900;
-    letter-spacing: 2px;
-  }
-  button:active { background: #082a66; }
-  button:disabled { background: #555555; border-color: #555555; }
-  input[type="file"] {
-    display: block;
-    width: 100%;
-    padding: 12px;
-    color: #111111;
-    background: #ffffff;
-    border: 3px dashed #111111;
-    border-radius: 8px;
-    font-family: inherit;
-    font-size: 22px;
-  }
-  input[type="file"]::file-selector-button {
-    margin-right: 12px;
-    padding: 12px 14px;
-    color: #111111;
-    background: #ffffff;
-    border: 2px solid #111111;
-    border-radius: 8px;
-    font-family: inherit;
-    font-size: 22px;
-    font-weight: 800;
-  }
-  .subhint {
-    margin: 10px 0 0;
-    color: #333333;
-    font-size: 22px;
-    line-height: 1.45;
-  }
-  .file-preview {
-    display: none;
-    margin-top: 16px;
-    padding-top: 14px;
-    border-top: 2px dashed #777777;
-  }
-  .preview-title {
-    margin-bottom: 10px;
-    font-size: 22px;
-    font-weight: 800;
-    line-height: 1.4;
-    word-break: break-all;
-  }
-  .preview-pages {
-    display: flex;
-    gap: 10px;
-    overflow-x: auto;
-    padding: 2px 2px 10px;
-    -webkit-overflow-scrolling: touch;
-  }
-  .preview-pages img {
-    flex: 0 0 auto;
-    width: 76vw;
-    max-width: 320px;
-    height: auto;
-    background: #ffffff;
-    border: 2px solid #111111;
-  }
-  .status {
-    display: none;
-    min-height: 78px;
-    margin-top: 24px;
-    padding: 14px;
-    border-radius: 8px;
-    font-size: 24px;
-    font-weight: 900;
-    line-height: 1.45;
-  }
-  .status.ok {
-    display: block;
-    color: #0B3D00;
-    background: #E8F5E9;
-    border: 3px solid #1B5E20;
-  }
-  .status.bad {
-    display: block;
-    color: #8B0000;
-    background: #FDECEA;
-    border: 3px solid #B71C1C;
-  }
-  .status-help {
-    display: none;
-    margin-top: 10px;
-    font-size: 22px;
-    font-weight: 600;
-    line-height: 1.5;
-  }
-  .status.bad .status-help { display: block; }
-  .status-help p { margin: 8px 0 0; }
-  .status-help ul { margin: 8px 0 0 1.2em; padding: 0; }
-  .status-help li { margin: 8px 0; }
-  .status-help strong { font-weight: 900; }
-  @media (max-width: 360px) {
-    button { font-size: 28px; }
-  }
+/* ============================================================
+   设计令牌：一处改色，全站同步
+   ============================================================ */
+:root{
+  --bg:#060911;
+  --bg-glow-1:rgba(91,124,255,.30);
+  --bg-glow-2:rgba(155,123,255,.24);
+  --bg-glow-3:rgba(45,226,197,.14);
+  --surface:linear-gradient(180deg,rgba(255,255,255,.062),rgba(255,255,255,.026));
+  --surface-flat:rgba(255,255,255,.04);
+  --surface-2:rgba(255,255,255,.055);
+  --line:rgba(255,255,255,.10);
+  --line-2:rgba(255,255,255,.16);
+  --text:#EAF0FA;
+  --muted:#98A5BA;
+  --faint:#6B7789;
+  --text-dim:rgba(234,240,250,.48);
+  --bg-blur:rgba(6,9,17,.72);
+  --accent:#6C8CFF;
+  --accent-2:#A78BFA;
+  --grad:linear-gradient(135deg,#5B7CFF 0%,#8B6DFF 55%,#B06CFF 100%);
+  --ok:#34D399;
+  --ok-bg:rgba(52,211,153,.10);
+  --ok-line:rgba(52,211,153,.34);
+  --bad:#FB7185;
+  --bad-bg:rgba(251,113,133,.10);
+  --bad-line:rgba(251,113,133,.34);
+  --ring:rgba(108,140,255,.55);
+  --shadow:0 30px 70px -34px rgba(0,0,0,.95);
+  --shadow-sm:0 10px 26px -16px rgba(0,0,0,.9);
+  --r-lg:24px; --r-md:16px; --r-sm:12px;
+  --ease:cubic-bezier(.16,1,.3,1);
+  --spring:cubic-bezier(.22,1.2,.36,1);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#F3F5FA;
+  --bg-glow-1:rgba(91,124,255,.20);
+  --bg-glow-2:rgba(167,139,250,.18);
+  --bg-glow-3:rgba(45,226,197,.12);
+  --surface:linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,255,255,.88));
+  --surface-flat:#FFFFFF;
+  --surface-2:rgba(15,23,42,.045);
+  --line:rgba(15,23,42,.10);
+  --line-2:rgba(15,23,42,.18);
+  --text:#0B1220;
+  --muted:#55617A;
+  --faint:#7C879B;
+  --text-dim:rgba(11,18,32,.50);
+  --bg-blur:rgba(243,245,250,.78);
+  --accent:#3D5CE5;
+  --accent-2:#7C5CE6;
+  --grad:linear-gradient(135deg,#4361EE 0%,#6C4BE8 55%,#8B4BE8 100%);
+  --ok:#0F9D6B;
+  --ok-bg:rgba(15,157,107,.09);
+  --ok-line:rgba(15,157,107,.30);
+  --bad:#D93A52;
+  --bad-bg:rgba(217,58,82,.08);
+  --bad-line:rgba(217,58,82,.28);
+  --ring:rgba(67,97,238,.40);
+  --shadow:0 30px 60px -34px rgba(15,23,42,.35);
+  --shadow-sm:0 10px 24px -16px rgba(15,23,42,.30);
+  color-scheme:light;
+}
+
+*,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{background:var(--bg)}
+body{
+  margin:0;
+  min-height:100dvh;
+  background:var(--bg);
+  color:var(--text);
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:16px;
+  line-height:1.6;
+  -webkit-text-size-adjust:100%;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+}
+body.is-booting{overflow:hidden;height:100dvh}
+h1,h2,h3,p,figure{margin:0}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+img{display:block;max-width:100%}
+::selection{background:rgba(108,140,255,.35)}
+
+/* 背景光晕：纯 radial-gradient，不做 filter:blur，滚动与动画都不掉帧 */
+.aurora{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.aurora span{position:absolute;border-radius:50%;will-change:transform;transform:translateZ(0)}
+.aurora .g1{width:130vw;height:130vw;left:-46vw;top:-64vw;background:radial-gradient(circle,rgba(91,124,255,.34) 0%,rgba(91,124,255,0) 62%);animation:drift1 30s var(--ease) infinite alternate}
+.aurora .g2{width:110vw;height:110vw;right:-42vw;top:-24vw;background:radial-gradient(circle,rgba(155,123,255,.30) 0%,rgba(155,123,255,0) 60%);animation:drift2 34s var(--ease) infinite alternate}
+.aurora .g3{width:120vw;height:120vw;left:-24vw;bottom:-62vw;background:radial-gradient(circle,rgba(45,226,197,.16) 0%,rgba(45,226,197,0) 60%);animation:drift3 38s var(--ease) infinite alternate}
+:root[data-theme="light"] .aurora span{opacity:.55}
+@keyframes drift1{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(6vw,5vw,0) scale(1.08)}}
+@keyframes drift2{from{transform:translate3d(0,0,0) scale(1.06)}to{transform:translate3d(-7vw,6vw,0) scale(1)}}
+@keyframes drift3{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(5vw,-6vw,0) scale(1.1)}}
+
+/* ---------------- 启动动画 ---------------- */
+.splash{
+  position:fixed;inset:0;z-index:100;
+  display:grid;place-items:center;
+  background:
+    radial-gradient(70% 55% at 50% 30%,rgba(91,124,255,.22),transparent 70%),
+    radial-gradient(60% 50% at 50% 85%,rgba(155,123,255,.16),transparent 72%),
+    var(--bg);
+  transition:opacity .38s var(--ease),transform .38s var(--ease),filter .38s var(--ease);
+  will-change:opacity,transform;
+}
+.splash.is-done{opacity:0;transform:scale(1.055);filter:blur(9px);pointer-events:none}
+.splash-inner{display:flex;flex-direction:column;align-items:center;gap:0;padding:0 24px;text-align:center}
+.splash-mark{position:relative;width:84px;height:84px;display:grid;place-items:center;animation:markIn .62s var(--spring) both}
+.splash-mark .tile{
+  position:absolute;inset:0;border-radius:24px;
+  background:var(--grad);
+  box-shadow:0 22px 44px -22px rgba(108,140,255,.85),inset 0 1px 0 rgba(255,255,255,.35);
+}
+.splash-mark .ring{
+  position:absolute;inset:-12px;border-radius:32px;
+  background:conic-gradient(from 0deg,rgba(108,140,255,0) 0deg,rgba(108,140,255,.85) 120deg,rgba(167,139,250,.15) 240deg,rgba(108,140,255,0) 360deg);
+  -webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 calc(100% - 1px));
+  mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 calc(100% - 1px));
+  animation:spin 1.5s linear infinite;
+}
+.splash-mark svg{position:relative;width:40px;height:40px;color:#fff}
+.splash-mark svg .draw{stroke-dasharray:60;stroke-dashoffset:60;animation:draw .78s var(--ease) .12s forwards}
+@keyframes markIn{0%{opacity:0;transform:scale(.82) translateY(6px)}60%{opacity:1}100%{opacity:1;transform:scale(1) translateY(0)}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes spin{to{transform:rotate(360deg)}}
+.splash-word{
+  margin-top:26px;font-size:22px;font-weight:800;letter-spacing:.32em;text-indent:.32em;
+  background:linear-gradient(180deg,var(--text),var(--text-dim));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:riseIn .6s var(--ease) .18s both;
+}
+.splash-sub{margin-top:8px;font-size:12px;letter-spacing:.22em;color:var(--faint);text-transform:uppercase;animation:riseIn .6s var(--ease) .26s both}
+.splash-bar{position:relative;width:180px;height:4px;margin-top:30px;border-radius:99px;background:var(--surface-2);overflow:hidden;animation:riseIn .6s var(--ease) .34s both}
+.splash-bar i{position:absolute;left:0;top:0;bottom:0;width:6%;border-radius:99px;background:var(--grad);box-shadow:0 0 14px rgba(108,140,255,.7);transition:width .34s var(--ease)}
+.splash-phase{margin-top:12px;font-size:13px;color:var(--muted);letter-spacing:.04em;min-height:20px;animation:riseIn .6s var(--ease) .4s both}
+@keyframes riseIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+/* ---------------- 壳层 ---------------- */
+.app{position:relative;z-index:1;padding:0 16px 40px;padding-bottom:calc(40px + env(safe-area-inset-bottom));max-width:1140px;margin:0 auto}
+.topbar{
+  position:sticky;top:0;z-index:20;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:14px 2px 12px;
+  background:var(--bg-blur);
+  -webkit-backdrop-filter:saturate(160%) blur(14px);
+  backdrop-filter:saturate(160%) blur(14px);
+  border-bottom:1px solid transparent;
+}
+.topbar.is-stuck{border-bottom-color:var(--line)}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.brand .logo{
+  width:38px;height:38px;border-radius:12px;display:grid;place-items:center;flex:0 0 auto;
+  background:var(--grad);
+  box-shadow:0 10px 22px -12px rgba(108,140,255,.9),inset 0 1px 0 rgba(255,255,255,.4);
+}
+.brand .logo svg{width:20px;height:20px;color:#fff}
+.brand b{display:block;font-size:16px;font-weight:800;letter-spacing:.01em;line-height:1.25}
+.brand small{display:block;font-size:11px;color:var(--faint);letter-spacing:.14em;text-transform:uppercase;line-height:1.3}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:99px;
+  font-size:12px;font-weight:700;color:var(--muted);
+  background:var(--surface-flat);border:1px solid var(--line);
+}
+.pill .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(52,211,153,.6);animation:pulse 2.4s ease-out infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+.icon-btn{
+  width:36px;height:36px;border-radius:11px;display:grid;place-items:center;
+  background:var(--surface-flat);border:1px solid var(--line);color:var(--muted);
+  transition:transform .22s var(--spring),color .2s,border-color .2s,background .2s;
+}
+.icon-btn:hover{color:var(--text);border-color:var(--line-2)}
+.icon-btn:active{transform:scale(.92)}
+.icon-btn svg{width:17px;height:17px}
+.icon-btn .moon{display:none}
+:root[data-theme="light"] .icon-btn .sun{display:none}
+:root[data-theme="light"] .icon-btn .moon{display:block}
+
+/* 入场：等启动动画退场后再依次浮入 */
+.stagger{opacity:0}
+body.is-ready .app>.topbar{animation:riseIn .55s var(--ease) both}
+body.is-ready .stagger{animation:riseIn .62s var(--ease) both}
+body.is-ready .stagger.d1{animation-delay:.05s}
+body.is-ready .stagger.d2{animation-delay:.12s}
+body.is-ready .stagger.d3{animation-delay:.19s}
+body.is-ready .stagger.d4{animation-delay:.26s}
+
+/* ---------------- 卡片 ---------------- */
+.card{
+  position:relative;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--r-lg);
+  box-shadow:var(--shadow);
+  -webkit-backdrop-filter:blur(16px) saturate(150%);
+  backdrop-filter:blur(16px) saturate(150%);
+}
+.card::before{
+  content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(180deg,rgba(255,255,255,.10),transparent 42%);
+  opacity:.7;
+}
+.grid{display:grid;gap:14px;margin-top:14px}
+
+/* 二维码卡 */
+.qr-card{display:flex;align-items:center;gap:14px;padding:14px;overflow:hidden}
+.qr-frame{
+  position:relative;flex:0 0 auto;width:104px;height:104px;border-radius:16px;padding:8px;
+  background:#fff;box-shadow:var(--shadow-sm),0 0 0 1px rgba(255,255,255,.10);
+}
+.qr-frame img{width:100%;height:100%;border-radius:9px;object-fit:contain}
+.qr-meta{min-width:0}
+.qr-title{font-size:15.5px;font-weight:800;letter-spacing:.01em}
+.qr-desc{margin-top:3px;font-size:13px;color:var(--muted);line-height:1.5}
+.qr-addr{
+  display:inline-flex;align-items:center;gap:6px;margin-top:9px;max-width:100%;
+  padding:5px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--line);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.qr-addr svg{width:13px;height:13px;flex:0 0 auto;opacity:.8}
+
+/* 工作区 */
+.work-card{padding:12px;overflow:hidden}
+.tabs{
+  position:relative;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px;
+  border-radius:14px;background:var(--surface-2);
+}
+.tabs .glider{
+  position:absolute;top:4px;bottom:4px;left:4px;width:calc((100% - 16px)/3);
+  border-radius:11px;background:var(--surface-flat);
+  border:1px solid var(--line-2);
+  box-shadow:0 8px 18px -12px rgba(0,0,0,.65);
+  transform:translateX(calc(var(--i,0) * (100% + 4px)));
+  transition:transform .42s var(--spring);
+  will-change:transform;
+}
+:root[data-theme="light"] .tabs .glider{background:#fff;box-shadow:0 6px 16px -10px rgba(15,23,42,.35)}
+.tab{
+  position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:7px;
+  height:44px;border-radius:11px;font-size:14.5px;font-weight:700;color:var(--muted);
+  transition:color .24s var(--ease),transform .24s var(--spring);
+}
+.tab svg{width:16px;height:16px;opacity:.9}
+.tab[aria-selected="true"]{color:var(--text)}
+.tab:active{transform:scale(.96)}
+.tab:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+
+.panels{padding:16px 4px 4px}
+.panel{display:none}
+.panel.is-active{display:block;animation:panelIn .36s var(--ease) both}
+@keyframes panelIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.field-label{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:9px}
+.field-label span{font-size:13.5px;font-weight:700;color:var(--muted);letter-spacing:.02em}
+.counter{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+.counter.is-warn{color:#FBBF24}
+
+textarea{
+  display:block;width:100%;min-height:150px;padding:14px 15px;resize:vertical;
+  color:var(--text);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:var(--r-md);
+  font-family:inherit;font-size:16.5px;line-height:1.7;
+  transition:border-color .2s,box-shadow .2s,background .2s;
+}
+textarea::placeholder{color:var(--faint)}
+textarea:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px var(--ring),inset 0 0 0 1px var(--ring);background:transparent}
+
+/* 拖放区 */
+.drop{
+  position:relative;display:flex;align-items:center;gap:13px;
+  padding:16px 15px;border-radius:var(--r-md);cursor:pointer;
+  background:var(--surface-2);
+  border:1.5px dashed var(--line-2);
+  transition:border-color .22s,background .22s,transform .22s var(--spring);
+}
+.drop:hover{border-color:var(--ring);background:var(--surface-flat)}
+.drop:active{transform:scale(.995)}
+.drop.is-drag{border-color:var(--accent);background:rgba(108,140,255,.10);transform:scale(1.01)}
+.drop:focus-within{outline:2px solid var(--ring);outline-offset:2px}
+.drop .ico{
+  width:42px;height:42px;flex:0 0 auto;border-radius:13px;display:grid;place-items:center;
+  background:var(--grad);color:#fff;box-shadow:0 10px 20px -12px rgba(108,140,255,.9);
+}
+.drop .ico svg{width:19px;height:19px}
+.drop .txt{min-width:0;flex:1}
+.drop .txt b{display:block;font-size:15px;font-weight:800}
+.drop .txt small{display:block;margin-top:2px;font-size:12.5px;color:var(--muted);line-height:1.45}
+.drop .chev{color:var(--faint);flex:0 0 auto}
+.drop .chev svg{width:16px;height:16px}
+.drop input[type="file"]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+
+/* 已选文件条 */
+.picked{display:none;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--line)}
+.picked.is-on{display:flex;animation:panelIn .3s var(--ease) both}
+.picked .thumb{width:34px;height:34px;border-radius:9px;object-fit:cover;background:var(--surface-flat);flex:0 0 auto;border:1px solid var(--line)}
+.picked .nm{min-width:0;flex:1;font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.picked .sz{font-size:11.5px;color:var(--faint);flex:0 0 auto;font-variant-numeric:tabular-nums}
+.picked .x{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:var(--faint);flex:0 0 auto}
+.picked .x:hover{color:var(--text);background:var(--surface-flat)}
+.picked .x svg{width:13px;height:13px}
+
+.hint{margin-top:10px;font-size:12.5px;line-height:1.6;color:var(--muted)}
+.hint.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
+.hint.chips b{font-weight:700;font-size:11.5px;color:var(--muted);padding:3px 8px;border-radius:7px;background:var(--surface-2);border:1px solid var(--line)}
+
+/* 进度条（上传） */
+.bar{display:none;height:3px;margin-top:12px;border-radius:99px;background:var(--surface-2);overflow:hidden}
+.bar.is-on{display:block}
+.bar i{display:block;height:100%;width:0;border-radius:99px;background:var(--grad);transition:width .2s linear}
+
+/* 按钮 */
+.btn{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;gap:9px;
+  width:100%;height:54px;margin-top:16px;border-radius:14px;
+  font-size:16.5px;font-weight:800;letter-spacing:.02em;
+  transition:transform .22s var(--spring),box-shadow .24s,opacity .2s,filter .2s;
+  overflow:hidden;isolation:isolate;
+}
+.btn svg{width:18px;height:18px}
+.btn-primary{color:#fff;background:var(--grad);box-shadow:0 16px 34px -18px rgba(108,140,255,.95),inset 0 1px 0 rgba(255,255,255,.28)}
+.btn-primary::after{
+  content:"";position:absolute;inset:0;z-index:-1;
+  background:linear-gradient(100deg,transparent 20%,rgba(255,255,255,.30) 48%,transparent 72%);
+  transform:translateX(-120%);transition:transform .7s var(--ease);
+}
+.btn-primary:hover::after{transform:translateX(120%)}
+.btn-primary:hover{box-shadow:0 20px 40px -18px rgba(108,140,255,1)}
+.btn-primary:active{transform:scale(.978)}
+.btn-ghost{color:var(--text);background:var(--surface-2);border:1px solid var(--line-2);box-shadow:none}
+.btn-ghost:hover{background:var(--surface-flat);border-color:var(--ring)}
+.btn-ghost:active{transform:scale(.978)}
+.btn[disabled]{cursor:not-allowed;filter:saturate(.5) brightness(.85);opacity:.75;transform:none}
+.btn[disabled]::after{display:none}
+.btn .spin{
+  width:16px;height:16px;border-radius:50%;flex:0 0 auto;
+  border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
+  animation:spin .7s linear infinite;
+}
+.btn:focus-visible{outline:2px solid var(--ring);outline-offset:3px}
+
+/* 预览区 */
+.preview{display:none;margin-top:14px}
+.preview.is-on{display:block;animation:panelIn .34s var(--ease) both}
+.preview-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.preview-title{font-size:13px;font-weight:700;color:var(--muted);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.preview-pages{display:flex;gap:9px;overflow-x:auto;padding:2px 2px 10px;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}
+.preview-pages::-webkit-scrollbar{height:5px}
+.preview-pages::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:9px}
+.preview-pages img{flex:0 0 auto;width:62%;max-width:250px;height:auto;border-radius:11px;background:#fff;border:1px solid var(--line-2);scroll-snap-align:start;box-shadow:var(--shadow-sm)}
+.preview-pages .ph{
+  flex:0 0 auto;width:62%;max-width:250px;aspect-ratio:210/297;border-radius:11px;
+  background:linear-gradient(100deg,var(--surface-2) 20%,rgba(255,255,255,.10) 40%,var(--surface-2) 60%);
+  background-size:220% 100%;animation:shimmer 1.3s linear infinite;border:1px solid var(--line);
+}
+@keyframes shimmer{from{background-position:120% 0}to{background-position:-120% 0}}
+
+/* 状态卡 */
+.status{
+  display:none;margin-top:14px;padding:14px;border-radius:var(--r-md);
+  border:1px solid var(--line);
+}
+.status.is-on{display:flex;gap:11px;align-items:flex-start;animation:statusIn .44s var(--spring) both}
+@keyframes statusIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+.status.ok{color:var(--ok);background:var(--ok-bg);border-color:var(--ok-line)}
+.status.bad{color:var(--bad);background:var(--bad-bg);border-color:var(--bad-line)}
+.status-ico{width:26px;height:26px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;margin-top:1px}
+.status.ok .status-ico{background:rgba(52,211,153,.16)}
+.status.bad .status-ico{background:rgba(251,113,133,.16)}
+.status-ico svg{width:15px;height:15px}
+.status-body{flex:1;min-width:0;color:var(--text)}
+.status-title{font-size:15px;font-weight:800;line-height:1.45}
+.status.ok .status-title{color:var(--ok)}
+.status.bad .status-title{color:var(--bad)}
+.status-help{margin-top:6px;font-size:13px;line-height:1.65;color:var(--muted)}
+.status-help p{margin:0}
+.status-help ul{margin:6px 0 0;padding-left:1.15em}
+.status-help li{margin:5px 0}
+.status-help strong{font-weight:800;color:var(--text)}
+.status-x{width:26px;height:26px;flex:0 0 auto;border-radius:8px;display:grid;place-items:center;color:var(--faint)}
+.status-x:hover{color:var(--text);background:var(--surface-2)}
+.status-x svg{width:12px;height:12px}
+
+/* 打印中状态 */
+.printing{display:none;align-items:center;gap:9px;margin-top:12px;padding:10px 13px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--line);font-size:13px;color:var(--muted)}
+.printing.is-on{display:flex;animation:panelIn .3s var(--ease) both}
+.dots{display:inline-flex;gap:4px}
+.dots i{width:5px;height:5px;border-radius:50%;background:var(--accent);animation:bounce 1.1s ease-in-out infinite}
+.dots i:nth-child(2){animation-delay:.15s}
+.dots i:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.45}30%{transform:translateY(-4px);opacity:1}}
+
+/* Toast */
+.toasts{position:fixed;left:50%;bottom:calc(22px + env(safe-area-inset-bottom));z-index:90;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;width:calc(100% - 32px);max-width:400px}
+.toast{
+  display:flex;align-items:center;gap:9px;max-width:100%;padding:11px 15px;border-radius:13px;
+  background:rgba(20,26,40,.94);color:#EDF2FB;font-size:14px;font-weight:600;
+  border:1px solid rgba(255,255,255,.14);box-shadow:0 18px 40px -20px rgba(0,0,0,.9);
+  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+  animation:toastIn .42s var(--spring) both;
+}
+:root[data-theme="light"] .toast{background:rgba(255,255,255,.97);color:#0B1220;border-color:rgba(15,23,42,.12);box-shadow:0 18px 40px -22px rgba(15,23,42,.4)}
+.toast.is-out{animation:toastOut .3s var(--ease) both}
+.toast svg{width:15px;height:15px;flex:0 0 auto;color:#FBBF24}
+@keyframes toastIn{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateY(8px) scale(.97)}}
+
+/* 页脚 */
+.foot{margin-top:22px;text-align:center;font-size:12px;color:var(--faint);line-height:1.9}
+.foot b{font-weight:700;color:var(--muted)}
+
+/* ---------------- 响应式 ---------------- */
+@media (min-width:720px){
+  .app{padding:0 24px 56px}
+  .grid{grid-template-columns:300px minmax(0,1fr);gap:18px;margin-top:18px}
+  .qr-card{flex-direction:column;align-items:stretch;padding:20px;gap:16px}
+  .qr-frame{width:100%;height:auto;min-height:240px;aspect-ratio:1;padding:10px}
+  .qr-title{font-size:16px}
+  .qr-desc{font-size:13.5px;margin-top:6px}
+  .qr-addr{font-size:12.5px}
+  .work-card{padding:14px}
+  .panels{padding:20px 6px 6px}
+  textarea{min-height:210px}
+  .status{margin-top:18px;padding:16px}
+  .drop{padding:20px 18px}
+}
+@media (min-width:1024px){
+  .grid{grid-template-columns:340px minmax(0,1fr);gap:22px}
+  .qr-card{position:sticky;top:76px}
+  .app{padding:0 32px 64px}
+  .brand b{font-size:17px}
+  textarea{min-height:240px;font-size:17px}
+}
+@media (max-width:380px){
+  .qr-frame{width:88px;height:88px;padding:6px}
+  .qr-desc{display:none}
+  .brand small{display:none}
+  .tab span{display:none}
+  .tab{gap:0}
+  .btn{font-size:16px}
+}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+  .stagger{opacity:1}
+  .splash.is-done{filter:none;transform:none;transition:opacity .18s linear}
+}
 </style>
 </head>
-<body>
-  <p class="tip">在家连接同一个 WiFi，扫码使用；在外面用手机流量，这个二维码打不开。</p>
+<body class="is-booting">
 
-  <div class="qr-wrap">
-    <img src="{{ qr_data_uri }}" alt="内网访问二维码">
-  </div>
-
-  <section>
-    <label for="textInput">在这里输入要打印的文字</label>
-    <textarea id="textInput" maxlength="{{ max_text_chars }}" autocomplete="off"></textarea>
-    <button id="textButton" type="button">打印文字</button>
-  </section>
-
-  <section>
-    <label for="imageInput">选择手机相册图片打印</label>
-    <input id="imageInput" type="file"
-           accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp">
-    <button id="imageButton" type="button">打印图片</button>
-  </section>
-
-  <section>
-    <label for="fileInput">打印手机文件 / 微信聊天文件</label>
-    <input id="fileInput" type="file">
-    <p class="subhint">支持 PDF、Word、Excel、PPT、TXT、HTML、图片。微信聊天里的文件，请在文件选择器里选择“聊天文件”；如果没看到，先把文件保存到手机。</p>
-    <button id="previewFileButton" type="button">预览文件</button>
-    <div id="filePreviewWrap" class="file-preview">
-      <div id="filePreviewTitle" class="preview-title"></div>
-      <div id="filePreviewPages" class="preview-pages"></div>
-      <button id="confirmFileButton" type="button">确认打印这份文件</button>
+<!-- 启动动画 -->
+<div class="splash" id="splash" role="status" aria-live="polite" aria-label="正在加载打印页面">
+  <div class="splash-inner">
+    <div class="splash-mark">
+      <span class="tile"></span>
+      <span class="ring"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path class="draw" d="M7 8V4h10v4"/>
+        <path class="draw" d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/>
+        <path class="draw" d="M7 14h10v6H7z"/>
+      </svg>
     </div>
-  </section>
-
-  <div id="statusBox" class="status" role="status" aria-live="polite">
-    <div id="statusTitle"></div>
-    <div id="statusHelp" class="status-help"></div>
+    <div class="splash-word">家庭打印</div>
+    <div class="splash-sub">HOME PRINT · LAN</div>
+    <div class="splash-bar"><i id="splashBar"></i></div>
+    <div class="splash-phase" id="splashPhase">正在连接打印服务…</div>
   </div>
+</div>
+
+<div class="aurora" aria-hidden="true"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
+
+<div class="app">
+  <header class="topbar" id="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/>
+        </svg>
+      </span>
+      <div>
+        <b>家庭打印</b>
+        <small>Home Print</small>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="pill"><i class="dot"></i>局域网直连</span>
+      <button class="icon-btn" id="themeToggle" type="button" aria-label="切换深浅色">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- 扫码卡 -->
+    <aside class="card qr-card stagger d1">
+      <div class="qr-frame">
+        <img id="qrImg" src="{{ qr_url }}" alt="内网访问二维码" width="360" height="360" fetchpriority="high" decoding="async">
+      </div>
+      <div class="qr-meta">
+        <p class="qr-title">手机扫码打开</p>
+        <p class="qr-desc">手机和这台电脑连同一个 WiFi，扫一下就能开始打印。</p>
+        <div class="qr-addr">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7L12 19"/></svg>
+          <span>{{ lan_url }}</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 工作区 -->
+    <section class="card work-card stagger d2">
+      <div class="tabs" role="tablist" aria-label="选择打印方式" id="tabs" style="--i:0">
+        <span class="glider" aria-hidden="true"></span>
+        <button class="tab" id="tab-text" type="button" role="tab" aria-selected="true" aria-controls="panel-text" data-tab="text">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h10M4 18h13"/></svg><span>文字</span>
+        </button>
+        <button class="tab" id="tab-image" type="button" role="tab" aria-selected="false" aria-controls="panel-image" data-tab="image" tabindex="-1">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M21 16l-5-5-6.5 6.5"/></svg><span>图片</span>
+        </button>
+        <button class="tab" id="tab-file" type="button" role="tab" aria-selected="false" aria-controls="panel-file" data-tab="file" tabindex="-1">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg><span>文件</span>
+        </button>
+      </div>
+
+      <div class="panels">
+        <!-- 文字 -->
+        <div class="panel is-active" id="panel-text" role="tabpanel" aria-labelledby="tab-text">
+          <div class="field-label">
+            <span>要打印的内容</span>
+            <span class="counter" id="textCounter">0 / {{ max_text_chars }}</span>
+          </div>
+          <textarea id="textInput" maxlength="{{ max_text_chars }}" autocomplete="off" placeholder="在这里输入或粘贴要打印的文字，例如菜谱、作业、地址……"></textarea>
+          <button class="btn btn-primary" id="textButton" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/></svg>
+            <span class="lbl">打印文字</span>
+          </button>
+        </div>
+
+        <!-- 图片 -->
+        <div class="panel" id="panel-image" role="tabpanel" aria-labelledby="tab-image" hidden>
+          <label class="drop" for="imageInput" id="imageDrop">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M21 16l-5-5-6.5 6.5"/></svg></span>
+            <span class="txt"><b>选择相册里的照片</b><small>支持 JPG / PNG / WEBP，最大 {{ max_image_mb }} MB</small></span>
+            <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></span>
+            <input id="imageInput" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp">
+          </label>
+          <div class="picked" id="imagePicked">
+            <img class="thumb" id="imageThumb" alt="">
+            <span class="nm" id="imageName"></span>
+            <span class="sz" id="imageSize"></span>
+            <button class="x" id="imageClear" type="button" aria-label="移除图片"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+          </div>
+          <div class="bar" id="imageBar"><i></i></div>
+          <p class="hint">打印时会自动按 A4 纸排版，整张照片缩放到一页内。</p>
+          <button class="btn btn-primary" id="imageButton" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/></svg>
+            <span class="lbl">打印图片</span>
+          </button>
+        </div>
+
+        <!-- 文件 -->
+        <div class="panel" id="panel-file" role="tabpanel" aria-labelledby="tab-file" hidden>
+          <label class="drop" for="fileInput" id="fileDrop">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span>
+            <span class="txt"><b>选择文件或微信聊天文件</b><small>最大 {{ max_file_mb }} MB，先预览再打印</small></span>
+            <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></span>
+            <input id="fileInput" type="file">
+          </label>
+          <div class="picked" id="filePicked">
+            <span class="thumb" style="display:grid;place-items:center;color:var(--muted)"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span>
+            <span class="nm" id="fileName"></span>
+            <span class="sz" id="fileSize"></span>
+            <button class="x" id="fileClear" type="button" aria-label="移除文件"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+          </div>
+          <div class="hint chips">
+            <b>PDF</b><b>Word</b><b>Excel</b><b>PPT</b><b>TXT</b><b>HTML</b><b>图片</b>
+          </div>
+          <p class="hint">微信里的文件，请在文件选择器中选「聊天文件」；如果没看到，先把文件保存到手机。</p>
+          <div class="bar" id="fileBar"><i></i></div>
+          <button class="btn btn-ghost" id="previewFileButton" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></svg>
+            <span class="lbl">预览文件</span>
+          </button>
+          <div class="preview" id="filePreviewWrap">
+            <div class="preview-head"><span class="preview-title" id="filePreviewTitle"></span></div>
+            <div class="preview-pages" id="filePreviewPages"></div>
+            <button class="btn btn-primary" id="confirmFileButton" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
+              <span class="lbl">确认打印这份文件</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="printing" id="printingBar">
+          <span class="dots"><i></i><i></i><i></i></span>
+          <span>已进入打印队列，正在打印…</span>
+        </div>
+
+        <div class="status" id="statusBox" role="status" aria-live="polite">
+          <span class="status-ico" id="statusIco"></span>
+          <div class="status-body">
+            <p class="status-title" id="statusTitle"></p>
+            <div class="status-help" id="statusHelp"></div>
+          </div>
+          <button class="status-x" id="statusClose" type="button" aria-label="关闭提示"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="foot stagger d3">
+    <p>打印任务按顺序排队 · 请保持电脑与打印机开机</p>
+    <p>密码忘了？问家里帮您设置这台电脑的人</p>
+  </footer>
+</div>
+
+<div class="toasts" id="toasts" aria-live="assertive"></div>
 
 <script>
 (function () {
   "use strict";
-
-  var OK_TEXT = "✅ 提交成功，正在排队打印";
-  var FAIL_TEXT = "❌ 打印失败";
   var MAX_IMAGE_BYTES = {{ max_image_bytes }};
   var MAX_IMAGE_MB = Math.round(MAX_IMAGE_BYTES / (1024 * 1024));
   var MAX_FILE_BYTES = {{ max_file_bytes }};
   var MAX_FILE_MB = Math.round(MAX_FILE_BYTES / (1024 * 1024));
+  var REDUCED = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
-  var textInput = document.getElementById("textInput");
-  var textButton = document.getElementById("textButton");
-  var imageInput = document.getElementById("imageInput");
-  var imageButton = document.getElementById("imageButton");
-  var fileInput = document.getElementById("fileInput");
-  var previewFileButton = document.getElementById("previewFileButton");
-  var filePreviewWrap = document.getElementById("filePreviewWrap");
-  var filePreviewTitle = document.getElementById("filePreviewTitle");
-  var filePreviewPages = document.getElementById("filePreviewPages");
-  var confirmFileButton = document.getElementById("confirmFileButton");
-  var statusBox = document.getElementById("statusBox");
-  var statusTitle = document.getElementById("statusTitle");
-  var statusHelp = document.getElementById("statusHelp");
-  var currentFileId = null;
+  function $(id) { return document.getElementById(id); }
+
+  /* ---------------- 启动动画：真实就绪驱动，最短 680ms / 最长 1500ms ---------------- */
+  var boot = (function () {
+    var splash = $("splash"), bar = $("splashBar"), phase = $("splashPhase");
+    if (!splash) { return { done: function () {} }; }
+    var MIN_SHOW = REDUCED ? 220 : 680;
+    var MAX_WAIT = REDUCED ? 600 : 1500;
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var finished = false, ready = false, tick = null;
+
+    function setP(p, text) {
+      if (bar) { bar.style.width = p + "%"; }
+      if (text && phase) { phase.textContent = text; }
+    }
+    function now() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+
+    // 0→78% 的推进感：不让进度条卡死在原地
+    var p = 6;
+    setP(p);
+    tick = window.setInterval(function () {
+      if (ready) { return; }
+      var elapsed = now() - t0;
+      var cap = 78 * (1 - Math.exp(-elapsed / 520));
+      if (cap > p) { p = cap; setP(Math.min(78, p)); }
+    }, 90);
+
+    function finish() {
+      if (finished) { return; }
+      finished = true;
+      window.clearInterval(tick);
+      setP(100, "准备就绪");
+      window.setTimeout(function () {
+        splash.classList.add("is-done");
+        document.body.classList.remove("is-booting");
+        document.body.classList.add("is-ready");
+        window.setTimeout(function () {
+          if (splash.parentNode) { splash.parentNode.removeChild(splash); }
+        }, REDUCED ? 200 : 420);
+      }, REDUCED ? 40 : 170);
+    }
+
+    function markReady(text) {
+      ready = true;
+      setP(100, text || "准备就绪");
+      var elapsed = now() - t0;
+      window.setTimeout(finish, Math.max(0, MIN_SHOW - elapsed));
+    }
+
+    if (document.readyState === "complete") {
+      markReady("准备就绪");
+    } else {
+      document.addEventListener("DOMContentLoaded", function () { setP(52, "正在加载界面…"); });
+      window.addEventListener("load", function () { setP(90, "正在准备二维码…"); markReady("准备就绪"); });
+      // 兜底：图片迟迟不返回也不能一直转圈
+      window.setTimeout(function () { if (!finished) { markReady("已就绪，可直接使用"); } }, MAX_WAIT);
+    }
+    return { done: finish };
+  })();
+
+  /* ---------------- Toast ---------------- */
+  var toasts = $("toasts");
+  function toast(msg) {
+    if (!toasts) { return; }
+    var el = document.createElement("div");
+    el.className = "toast";
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/></svg>';
+    el.appendChild(document.createTextNode(msg));
+    toasts.appendChild(el);
+    window.setTimeout(function () {
+      el.classList.add("is-out");
+      window.setTimeout(function () { if (el.parentNode) { el.parentNode.removeChild(el); } }, 320);
+    }, 2600);
+  }
+
+  /* ---------------- 主题 ---------------- */
+  var themeBtn = $("themeToggle");
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  }
+  function syncThemeColor() {
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) { meta.setAttribute("content", currentTheme() === "light" ? "#F3F5FA" : "#060911"); }
+  }
+  syncThemeColor();
+  if (themeBtn) {
+    themeBtn.addEventListener("click", function () {
+      var next = currentTheme() === "light" ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("fp-theme", next); } catch (e) {}
+      syncThemeColor();
+    });
+  }
+
+  /* ---------------- 顶栏滚动阴影 ---------------- */
+  var topbar = $("topbar");
+  var onScroll = function () {
+    if (!topbar) { return; }
+    if (window.scrollY > 4) { topbar.classList.add("is-stuck"); }
+    else { topbar.classList.remove("is-stuck"); }
+  };
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* ---------------- Tabs ---------------- */
+  var tabWrap = $("tabs");
+  var tabs = [].slice.call(document.querySelectorAll(".tab"));
+  var panels = { text: $("panel-text"), image: $("panel-image"), file: $("panel-file") };
+
+  function selectTab(name, focus) {
+    var idx = 0;
+    tabs.forEach(function (t, i) {
+      var on = t.getAttribute("data-tab") === name;
+      if (on) { idx = i; }
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+    });
+    Object.keys(panels).forEach(function (k) {
+      var el = panels[k];
+      var on = k === name;
+      el.classList.toggle("is-active", on);
+      if (on) { el.removeAttribute("hidden"); }
+      else { el.setAttribute("hidden", ""); }
+    });
+    if (tabWrap) { tabWrap.style.setProperty("--i", String(idx)); }
+    if (focus) { tabs[idx].focus(); }
+  }
+  tabs.forEach(function (t) {
+    t.addEventListener("click", function () { selectTab(t.getAttribute("data-tab")); });
+    t.addEventListener("keydown", function (e) {
+      var idx = tabs.indexOf(t), next = null;
+      if (e.key === "ArrowRight") { next = (idx + 1) % tabs.length; }
+      if (e.key === "ArrowLeft") { next = (idx - 1 + tabs.length) % tabs.length; }
+      if (e.key === "Home") { next = 0; }
+      if (e.key === "End") { next = tabs.length - 1; }
+      if (next !== null) {
+        e.preventDefault();
+        selectTab(tabs[next].getAttribute("data-tab"), true);
+      }
+    });
+  });
+
+  /* ---------------- 通用 UI 状态 ---------------- */
+  var statusBox = $("statusBox"), statusTitle = $("statusTitle"), statusHelp = $("statusHelp");
+  var statusIco = $("statusIco"), statusClose = $("statusClose");
+  var printingBar = $("printingBar");
+
+  var ICON_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  var ICON_BAD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v5M12 16.5v.01"/><circle cx="12" cy="12" r="9"/></svg>';
 
   var PRINT_REASON = {
     paper_out: "打印机缺纸",
@@ -1589,246 +2360,329 @@ PAGE_HTML = r"""<!doctype html>
     page_punt: "打印机无法打印当前页",
     printer_error: "打印机或驱动报错"
   };
-
   var REASON_EXTRA = {
     no_printer: ["默认打印机：打开 Windows 设置 → 蓝牙和其他设备 → 打印机和扫描仪，点你的打印机 → 设为默认值。"],
     door_open: ["打印机盖：打开再重新关紧墨盒/硒鼓盖和纸盒，听到卡扣声后再试。"],
     no_toner: ["墨粉：检查墨盒/硒鼓是否装好，缺墨请更换或联系家人。"],
-    paused: ["暂停状态：在 Windows 打印机队列里点“继续”，或按打印机上的继续键。"],
+    paused: ["暂停状态：在 Windows 打印机队列里点「继续」，或按打印机上的继续键。"],
     output_full: ["出纸口：把已经打印出来的纸拿走，再重新提交。"]
   };
 
+  function hideStatus() {
+    statusBox.classList.remove("is-on", "ok", "bad");
+  }
   function showStatus(ok, reason) {
-    statusBox.className = ok ? "status ok" : "status bad";
-    var known = PRINT_REASON[reason];
-    statusTitle.textContent = ok
-      ? OK_TEXT
-      : (known ? FAIL_TEXT + "：" + known : FAIL_TEXT);
+    var known = reason ? PRINT_REASON[reason] : "";
+    statusIco.innerHTML = ok ? ICON_OK : ICON_BAD;
+    statusTitle.textContent = ok ? "已提交，正在排队打印" : (known ? "打印失败：" + known : "打印失败");
     statusHelp.innerHTML = "";
-    if (ok) {
-      return;
+    if (!ok) {
+      var intro = document.createElement("p");
+      intro.textContent = known
+        ? "请按下面的办法处理："
+        : "可能是缺纸、卡纸，或者打印机离线/连接松动。请按下面的办法处理：";
+      statusHelp.appendChild(intro);
+
+      var list = document.createElement("ul");
+      var items = [
+        ["缺纸：", "打开纸盒放入 A4 纸，把纸盒推回，按打印机上的「继续/开始」键，然后回到本页重新打印。"],
+        ["卡纸：", "打开打印机盖或后盖，顺着纸张走纸方向轻轻拉出，不要硬拽；关好盖，按「继续」键再试。"],
+        ["离线/线松：", "检查打印机电源、USB 线或 WiFi；到 Windows 设置里确认默认打印机在线，再重新提交。"],
+        ["其他：", "看电脑上的打印程序窗口或本程序控制台，按提示处理后再试一次。"]
+      ];
+      (REASON_EXTRA[reason] || []).forEach(function (extra) {
+        var parts = extra.split("：");
+        items.unshift([parts[0] + "：", parts.slice(1).join("：")]);
+      });
+      items.forEach(function (item) {
+        var li = document.createElement("li");
+        var strong = document.createElement("strong");
+        strong.textContent = item[0];
+        li.appendChild(strong);
+        li.appendChild(document.createTextNode(item[1]));
+        list.appendChild(li);
+      });
+      statusHelp.appendChild(list);
     }
+    statusBox.classList.remove("ok", "bad");
+    statusBox.classList.add("is-on", ok ? "ok" : "bad");
+    if (!ok) { statusBox.scrollIntoView({ block: "nearest", behavior: REDUCED ? "auto" : "smooth" }); }
+  }
+  if (statusClose) { statusClose.addEventListener("click", hideStatus); }
 
-    var intro = document.createElement("p");
-    intro.textContent = known
-      ? "请按下面的办法处理："
-      : "可能是缺纸、卡纸，或者打印机离线/连接松动。请按下面的办法处理：";
-    statusHelp.appendChild(intro);
-
-    var list = document.createElement("ul");
-    var items = [
-      ["缺纸：", "打开纸盒放入 A4 纸，把纸盒推回，按打印机上的“继续/开始”键，然后回到本页重新打印。"],
-      ["卡纸：", "打开打印机盖或后盖，顺着纸张走纸方向轻轻拉出，不要硬拽；关好盖，按“继续”键再试。"],
-      ["离线/线松：", "检查打印机电源、USB 线或 WiFi；到 Windows 设置里确认默认打印机在线，再重新提交。"],
-      ["其他：", "看电脑上的打印程序窗口或本程序控制台，按提示处理后再试一次。"]
-    ];
-    (REASON_EXTRA[reason] || []).forEach(function (extra) { items.unshift([extra.split("：")[0] + "：", extra.split("：").slice(1).join("：")]); });
-    items.forEach(function (item) {
-      var li = document.createElement("li");
-      var strong = document.createElement("strong");
-      strong.textContent = item[0];
-      li.appendChild(strong);
-      li.appendChild(document.createTextNode(item[1]));
-      list.appendChild(li);
-    });
-    statusHelp.appendChild(list);
+  /* ---------------- 按钮忙碌态 ---------------- */
+  function busy(btn, on, label) {
+    if (!btn) { return; }
+    var textEl = btn.querySelector(".lbl");
+    if (on) {
+      if (!btn.getAttribute("data-label")) {
+        btn.setAttribute("data-label", textEl ? textEl.textContent : btn.textContent);
+      }
+      btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
+      if (textEl) { textEl.textContent = label || "正在提交…"; }
+      if (!btn.querySelector(".spin")) {
+        var sp = document.createElement("span");
+        sp.className = "spin";
+        btn.insertBefore(sp, btn.firstChild);
+      }
+    } else {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      var sp2 = btn.querySelector(".spin");
+      if (sp2) { sp2.parentNode.removeChild(sp2); }
+      var lab = btn.getAttribute("data-label");
+      if (lab && textEl) { textEl.textContent = lab; }
+      btn.removeAttribute("data-label");
+    }
   }
 
-  function handleUnauthorized(response) {
-    if (response.status === 401) {
+  function handleUnauthorized(status) {
+    if (status === 401) {
       window.location.href = "/";
       return true;
     }
     return false;
   }
 
-  function startPolling(taskId) {
+  /* ---------------- 上传进度（XHR 才有真实进度） ---------------- */
+  function barOf(id) {
+    var el = $(id);
+    return {
+      show: function () { if (el) { el.classList.add("is-on"); this.set(0); } },
+      set: function (p) { var i = el && el.firstElementChild; if (i) { i.style.width = Math.max(0, Math.min(100, p)) + "%"; } },
+      hide: function () {
+        if (!el) { return; }
+        var self = this;
+        window.setTimeout(function () { el.classList.remove("is-on"); self.set(0); }, 380);
+      }
+    };
+  }
+
+  function post(url, body, opts, cb) {
+    var xhr = new XMLHttpRequest();
+    var bar = opts && opts.bar;
+    xhr.open("POST", url, true);
+    if (opts && opts.json) { xhr.setRequestHeader("Content-Type", "application/json"); }
+    if (xhr.upload && bar) {
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) { bar.set(Math.round(e.loaded / e.total * 92)); }
+      };
+    }
+    xhr.onload = function () {
+      if (handleUnauthorized(xhr.status)) { return; }
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+      cb({ ok: xhr.status >= 200 && xhr.status < 300 && !!data && data.ok === true, status: xhr.status, data: data || {} });
+    };
+    xhr.onerror = function () { cb({ ok: false, status: 0, data: {}, network: true }); };
+    xhr.send(body);
+  }
+
+  function poll(taskId) {
     var tries = 0;
+    if (printingBar) { printingBar.classList.add("is-on"); }
     var timer = window.setInterval(function () {
       tries += 1;
-      fetch("/status/" + encodeURIComponent(taskId), { cache: "no-store" })
-        .then(function (response) {
-          if (handleUnauthorized(response)) {
-            window.clearInterval(timer);
-            return null;
-          }
-          if (!response.ok) {
-            return null;
-          }
-          return response.json();
-        })
-        .then(function (data) {
-          if (!data) {
-            return;
-          }
-          if (data.status === "error") {
-            showStatus(false, data.reason || "");
-            window.clearInterval(timer);
-          } else if (data.status === "done" || data.status === "unknown") {
-            window.clearInterval(timer);
-          }
-        })
-        .catch(function () {
-          // 网络短暂波动时不打扰用户，下一轮继续查。
-        });
-
-      if (tries >= 3600) {
-        window.clearInterval(timer);
-      }
+      if (tries > 3600) { window.clearInterval(timer); if (printingBar) { printingBar.classList.remove("is-on"); } return; }
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/status/" + encodeURIComponent(taskId), true);
+      xhr.onload = function () {
+        if (handleUnauthorized(xhr.status)) { window.clearInterval(timer); return; }
+        if (xhr.status !== 200) { return; }
+        var data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+        if (!data) { return; }
+        if (data.status === "error") {
+          window.clearInterval(timer);
+          if (printingBar) { printingBar.classList.remove("is-on"); }
+          showStatus(false, data.reason || "");
+        } else if (data.status === "done" || data.status === "unknown") {
+          window.clearInterval(timer);
+          if (printingBar) { printingBar.classList.remove("is-on"); }
+        }
+      };
+      xhr.send();
     }, 1200);
   }
 
-  textButton.addEventListener("click", function () {
-    var text = textInput.value;
-    if (!text.trim()) {
-      window.alert("请先输入要打印的文字");
-      textInput.focus();
-      return;
-    }
+  function humanSize(bytes) {
+    if (!bytes && bytes !== 0) { return ""; }
+    if (bytes < 1024) { return bytes + " B"; }
+    if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(0) + " KB"; }
+    return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  }
 
-    textButton.disabled = true;
-    fetch("/print/text", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: text })
-    })
-      .then(function (response) {
-        if (handleUnauthorized(response)) {
-          return null;
-        }
-        return response.json()
-          .catch(function () { return { ok: false }; })
-          .then(function (data) {
-            return { ok: response.ok && data.ok, taskId: data.task_id };
-          });
-      })
-      .then(function (result) {
-        if (!result) {
-          return;
-        }
-        if (result.ok) {
+  /* ---------------- 文字 ---------------- */
+  var textInput = $("textInput"), textButton = $("textButton"), textCounter = $("textCounter");
+  var MAX_TEXT = {{ max_text_chars }};
+  function syncCounter() {
+    if (!textCounter || !textInput) { return; }
+    var n = textInput.value.length;
+    textCounter.textContent = n + " / " + MAX_TEXT;
+    textCounter.classList.toggle("is-warn", n > MAX_TEXT * 0.9);
+  }
+  if (textInput) {
+    textInput.addEventListener("input", syncCounter);
+    syncCounter();
+  }
+  if (textButton) {
+    textButton.addEventListener("click", function () {
+      var text = textInput.value;
+      if (!text.trim()) {
+        toast("请先输入要打印的文字");
+        textInput.focus();
+        return;
+      }
+      hideStatus();
+      busy(textButton, true, "正在提交…");
+      post("/print/text", JSON.stringify({ text: text }), { json: true }, function (res) {
+        busy(textButton, false);
+        if (res.ok) {
           showStatus(true);
-          if (result.taskId) {
-            startPolling(result.taskId);
-          }
+          if (res.data.task_id) { poll(res.data.task_id); }
+        } else if (res.network) {
+          toast("网络连接失败，请重试");
         } else {
           showStatus(false);
         }
-      })
-      .catch(function () {
-        showStatus(false);
-      })
-      .then(function () {
-        textButton.disabled = false;
       });
-  });
+    });
+  }
 
-  imageButton.addEventListener("click", function () {
-    var file = imageInput.files && imageInput.files[0];
-    if (!file) {
-      window.alert("请先选择手机相册里的图片");
-      return;
-    }
-    if (!/\.(jpe?g|png|webp)$/i.test(file.name)) {
-      window.alert("只支持 jpg、png、webp 图片");
-      return;
-    }
-    if (file.size > MAX_IMAGE_BYTES) {
-      window.alert("图片太大了，请换一张不超过 " + MAX_IMAGE_MB + "MB 的图片");
-      return;
-    }
+  /* ---------------- 图片 ---------------- */
+  var imageInput = $("imageInput"), imageButton = $("imageButton");
+  var imagePicked = $("imagePicked"), imageName = $("imageName"), imageSize = $("imageSize");
+  var imageThumb = $("imageThumb"), imageClear = $("imageClear"), imageDrop = $("imageDrop");
+  var imageBar = barOf("imageBar");
+  var imageUrl = null;
 
-    var formData = new FormData();
-    formData.append("image", file, file.name);
-
-    imageButton.disabled = true;
-    fetch("/print/image", {
-      method: "POST",
-      body: formData
-    })
-      .then(function (response) {
-        if (handleUnauthorized(response)) {
-          return null;
-        }
-        return response.json()
-          .catch(function () { return { ok: false }; })
-          .then(function (data) {
-            return { ok: response.ok && data.ok, taskId: data.task_id };
-          });
-      })
-      .then(function (result) {
-        if (!result) {
-          return;
-        }
-        if (result.ok) {
+  function resetImage() {
+    imageInput.value = "";
+    if (imagePicked) { imagePicked.classList.remove("is-on"); }
+    if (imageUrl) { URL.revokeObjectURL(imageUrl); imageUrl = null; }
+  }
+  if (imageInput) {
+    imageInput.addEventListener("change", function () {
+      var f = imageInput.files && imageInput.files[0];
+      if (!f) { return; }
+      if (imageName) { imageName.textContent = f.name; }
+      if (imageSize) { imageSize.textContent = humanSize(f.size); }
+      if (imageThumb && f.type && f.type.indexOf("image/") === 0) {
+        if (imageUrl) { URL.revokeObjectURL(imageUrl); }
+        imageUrl = URL.createObjectURL(f);
+        imageThumb.src = imageUrl;
+      }
+      if (imagePicked) { imagePicked.classList.add("is-on"); }
+    });
+  }
+  if (imageClear) {
+    imageClear.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); resetImage(); });
+  }
+  if (imageDrop) {
+    ["dragenter", "dragover"].forEach(function (ev) {
+      imageDrop.addEventListener(ev, function (e) { e.preventDefault(); imageDrop.classList.add("is-drag"); });
+    });
+    ["dragleave", "drop"].forEach(function (ev) {
+      imageDrop.addEventListener(ev, function () { imageDrop.classList.remove("is-drag"); });
+    });
+  }
+  if (imageButton) {
+    imageButton.addEventListener("click", function () {
+      var file = imageInput.files && imageInput.files[0];
+      if (!file) { toast("请先选择手机相册里的图片"); return; }
+      if (!/\.(jpe?g|png|webp)$/i.test(file.name)) { toast("只支持 jpg、png、webp 图片"); return; }
+      if (file.size > MAX_IMAGE_BYTES) { toast("图片太大了，请换一张不超过 " + MAX_IMAGE_MB + "MB 的图片"); return; }
+      var fd = new FormData();
+      fd.append("image", file, file.name);
+      hideStatus();
+      busy(imageButton, true, "正在上传…");
+      imageBar.show();
+      post("/print/image", fd, { bar: imageBar }, function (res) {
+        busy(imageButton, false);
+        imageBar.hide();
+        if (res.ok) {
           showStatus(true);
-          if (result.taskId) {
-            startPolling(result.taskId);
-          }
+          resetImage();
+          if (res.data.task_id) { poll(res.data.task_id); }
+        } else if (res.network) {
+          toast("网络连接失败，请重试");
         } else {
           showStatus(false);
         }
-      })
-      .catch(function () {
-        showStatus(false);
-      })
-      .then(function () {
-        imageButton.disabled = false;
       });
-  });
+    });
+  }
+
+  /* ---------------- 文件 ---------------- */
+  var fileInput = $("fileInput"), previewFileButton = $("previewFileButton");
+  var filePicked = $("filePicked"), fileName = $("fileName"), fileSize = $("fileSize"), fileClear = $("fileClear");
+  var fileDrop = $("fileDrop");
+  var fileBar = barOf("fileBar");
+  var filePreviewWrap = $("filePreviewWrap"), filePreviewTitle = $("filePreviewTitle"), filePreviewPages = $("filePreviewPages");
+  var confirmFileButton = $("confirmFileButton");
+  var currentFileId = null;
 
   function clearFilePreview() {
     currentFileId = null;
-    filePreviewWrap.style.display = "none";
-    filePreviewTitle.textContent = "";
-    filePreviewPages.innerHTML = "";
+    if (filePreviewWrap) { filePreviewWrap.classList.remove("is-on"); }
+    if (filePreviewTitle) { filePreviewTitle.textContent = ""; }
+    if (filePreviewPages) { filePreviewPages.innerHTML = ""; }
+  }
+  function resetFile() {
+    if (fileInput) { fileInput.value = ""; }
+    if (filePicked) { filePicked.classList.remove("is-on"); }
+    clearFilePreview();
+  }
+  if (fileInput) {
+    fileInput.addEventListener("change", function () {
+      clearFilePreview();
+      var f = fileInput.files && fileInput.files[0];
+      if (!f) { return; }
+      if (fileName) { fileName.textContent = f.name; }
+      if (fileSize) { fileSize.textContent = humanSize(f.size); }
+      if (filePicked) { filePicked.classList.add("is-on"); }
+    });
+  }
+  if (fileClear) {
+    fileClear.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); resetFile(); });
+  }
+  if (fileDrop) {
+    ["dragenter", "dragover"].forEach(function (ev) {
+      fileDrop.addEventListener(ev, function (e) { e.preventDefault(); fileDrop.classList.add("is-drag"); });
+    });
+    ["dragleave", "drop"].forEach(function (ev) {
+      fileDrop.addEventListener(ev, function () { fileDrop.classList.remove("is-drag"); });
+    });
   }
 
-  fileInput.addEventListener("change", function () {
-    clearFilePreview();
-  });
+  if (previewFileButton) {
+    previewFileButton.addEventListener("click", function () {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) { toast("请先选择手机文件或微信聊天文件"); return; }
+      if (file.size > MAX_FILE_BYTES) { toast("文件太大了，请上传不超过 " + MAX_FILE_MB + "MB 的文件"); return; }
 
-  previewFileButton.addEventListener("click", function () {
-    var file = fileInput.files && fileInput.files[0];
-    if (!file) {
-      window.alert("请先选择手机文件或微信聊天文件");
-      return;
-    }
-    if (file.size > MAX_FILE_BYTES) {
-      window.alert("文件太大了，请上传不超过 " + MAX_FILE_MB + "MB 的文件");
-      return;
-    }
+      var fd = new FormData();
+      fd.append("file", file, file.name);
+      clearFilePreview();
+      busy(previewFileButton, true, "正在准备预览…");
+      fileBar.show();
 
-    var formData = new FormData();
-    formData.append("file", file, file.name);
+      // 先铺骨架屏，等待期间页面不空
+      filePreviewPages.innerHTML = '<div class="ph"></div><div class="ph"></div>';
+      filePreviewTitle.textContent = "正在生成预览…";
+      filePreviewWrap.classList.add("is-on");
 
-    clearFilePreview();
-    previewFileButton.disabled = true;
-    previewFileButton.textContent = "正在准备预览...";
-    fetch("/print/file", {
-      method: "POST",
-      body: formData
-    })
-      .then(function (response) {
-        if (handleUnauthorized(response)) {
-          return null;
-        }
-        return response.json()
-          .catch(function () { return { ok: false }; })
-          .then(function (data) {
-            return { ok: response.ok && data.ok, data: data };
-          });
-      })
-      .then(function (result) {
-        if (!result) {
+      post("/print/file", fd, { bar: fileBar }, function (res) {
+        busy(previewFileButton, false);
+        fileBar.hide();
+        if (res.network) { toast("网络连接失败，请重试"); clearFilePreview(); return; }
+        if (!res.ok) {
+          clearFilePreview();
+          toast((res.data && res.data.message) || "文件处理失败，请换一个文件再试");
           return;
         }
-        if (!result.ok) {
-          window.alert(result.data.message || "文件处理失败，请换一个文件再试");
-          return;
-        }
-
-        var data = result.data;
+        var data = res.data;
         currentFileId = data.file_id;
         var title = data.name + " · 共 " + data.pages + " 页";
         if (data.preview_count < data.pages) {
@@ -1837,66 +2691,35 @@ PAGE_HTML = r"""<!doctype html>
         filePreviewTitle.textContent = title;
         filePreviewPages.innerHTML = "";
         (data.previews || []).forEach(function (src, index) {
-          var image = document.createElement("img");
-          image.src = src;
-          image.alt = "第 " + (index + 1) + " 页预览";
-          filePreviewPages.appendChild(image);
+          var img = document.createElement("img");
+          img.src = src;
+          img.alt = "第 " + (index + 1) + " 页预览";
+          img.loading = "lazy";
+          img.decoding = "async";
+          filePreviewPages.appendChild(img);
         });
-        filePreviewWrap.style.display = "block";
-      })
-      .catch(function () {
-        window.alert("网络连接失败，请重试");
-      })
-      .then(function () {
-        previewFileButton.disabled = false;
-        previewFileButton.textContent = "预览文件";
+        filePreviewWrap.classList.add("is-on");
       });
-  });
+    });
+  }
 
-  confirmFileButton.addEventListener("click", function () {
-    if (!currentFileId) {
-      window.alert("请先选择文件并预览");
-      return;
-    }
-
-    confirmFileButton.disabled = true;
-    confirmFileButton.textContent = "正在提交打印...";
-    fetch("/print/file/" + encodeURIComponent(currentFileId), {
-      method: "POST"
-    })
-      .then(function (response) {
-        if (handleUnauthorized(response)) {
-          return null;
-        }
-        return response.json()
-          .catch(function () { return { ok: false }; })
-          .then(function (data) {
-            return { ok: response.ok && data.ok, data: data };
-          });
-      })
-      .then(function (result) {
-        if (!result) {
-          return;
-        }
-        if (result.ok) {
+  if (confirmFileButton) {
+    confirmFileButton.addEventListener("click", function () {
+      if (!currentFileId) { toast("请先选择文件并预览"); return; }
+      busy(confirmFileButton, true, "正在提交打印…");
+      post("/print/file/" + encodeURIComponent(currentFileId), null, {}, function (res) {
+        busy(confirmFileButton, false);
+        if (res.network) { toast("网络连接失败，请重试"); return; }
+        if (res.ok) {
           showStatus(true);
-          if (result.data.task_id) {
-            startPolling(result.data.task_id);
-          }
-          clearFilePreview();
-          fileInput.value = "";
+          if (res.data.task_id) { poll(res.data.task_id); }
+          resetFile();
         } else {
-          window.alert(result.data.message || "文件提交失败，请重新选择");
+          toast((res.data && res.data.message) || "文件提交失败，请重新选择");
         }
-      })
-      .catch(function () {
-        window.alert("网络连接失败，请重试");
-      })
-      .then(function () {
-        confirmFileButton.disabled = false;
-        confirmFileButton.textContent = "确认打印这份文件";
       });
-  });
+    });
+  }
 })();
 </script>
 </body>
@@ -1909,24 +2732,66 @@ ERROR_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>家庭打印</title>
+<meta name="theme-color" content="#060911">
+<title>家庭打印 · 出了点问题</title>
 <style>
-  body {
-    margin: 0 auto;
-    padding: 32px 20px;
-    max-width: 640px;
-    background: #ffffff;
-    color: #111111;
-    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-    font-size: 24px;
-    line-height: 1.6;
+  :root{
+    --bg:#060911;--text:#EAF0FA;--muted:#98A5BA;--line:rgba(255,255,255,.10);
+    --surface:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.03));
+    --grad:linear-gradient(135deg,#5B7CFF 0%,#8B6DFF 55%,#B06CFF 100%);
+    --ease:cubic-bezier(.16,1,.3,1);--spring:cubic-bezier(.22,1.2,.36,1);
+    color-scheme:dark;
   }
-  a { display: block; margin-top: 28px; color: #0B3D91; font-size: 26px; font-weight: 900; }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#F3F5FA;--text:#0B1220;--muted:#55617A;--line:rgba(15,23,42,.10);
+      --surface:linear-gradient(180deg,rgba(255,255,255,.98),rgba(255,255,255,.9));
+      color-scheme:light;
+    }
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  body{
+    margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px 18px;
+    background:radial-gradient(70% 55% at 50% 0%,rgba(91,124,255,.20),transparent 68%),var(--bg);
+    color:var(--text);
+    font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,-apple-system,sans-serif;
+    font-size:16px;line-height:1.6;-webkit-text-size-adjust:100%;
+  }
+  .card{
+    width:100%;max-width:420px;padding:30px 24px;border-radius:24px;text-align:center;
+    background:var(--surface);border:1px solid var(--line);
+    box-shadow:0 40px 90px -44px rgba(0,0,0,.9);
+    animation:riseIn .6s var(--ease) both;
+  }
+  @keyframes riseIn{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+  .ico{
+    width:56px;height:56px;border-radius:18px;margin:0 auto;display:grid;place-items:center;
+    background:var(--grad);box-shadow:0 18px 36px -20px rgba(108,140,255,.9);
+  }
+  .ico svg{width:26px;height:26px;color:#fff}
+  h1{margin:18px 0 0;font-size:19px;font-weight:800}
+  p{margin:9px 0 0;font-size:14px;color:var(--muted)}
+  a{
+    display:flex;align-items:center;justify-content:center;width:100%;height:52px;margin-top:22px;
+    border-radius:14px;color:#fff;text-decoration:none;font-size:16px;font-weight:800;
+    background:var(--grad);box-shadow:0 16px 34px -20px rgba(108,140,255,.95);
+    transition:transform .22s var(--spring);
+  }
+  a:active{transform:scale(.978)}
+  @media (prefers-reduced-motion: reduce){*{animation-duration:.001ms!important;transition-duration:.001ms!important}}
 </style>
 </head>
 <body>
-  <p>{{ message }}</p>
-  <a href="/">返回首页</a>
+  <div class="card">
+    <div class="ico">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M7 8V4h10v4"/><path d="M7 17H5.5A1.5 1.5 0 0 1 4 15.5v-5A1.5 1.5 0 0 1 5.5 9h13A1.5 1.5 0 0 1 20 10.5v5a1.5 1.5 0 0 1-1.5 1.5H17"/><path d="M7 14h10v6H7z"/>
+      </svg>
+    </div>
+    <h1>这个页面打不开</h1>
+    <p>{{ message }}</p>
+    <a href="/">返回首页</a>
+  </div>
 </body>
 </html>
 """
@@ -1957,25 +2822,71 @@ def _friendly_api_failure():
 
 @app.after_request
 def _set_safe_headers(response):
-    response.headers["Cache-Control"] = "no-store, max-age=0"
-    response.headers["Pragma"] = "no-cache"
+    # /qr.png 这类可长期缓存的资源已在路由里自带 Cache-Control，不覆盖。
+    if "Cache-Control" not in response.headers:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "no-referrer"
+
+    # ---- 首屏优化：HTML 页面走 ETag 协商缓存 + gzip 传输压缩 ----
+    is_page = response.status_code == 200 and response.mimetype == "text/html"
+    if is_page and not response.direct_passthrough:
+        body = response.get_data()
+        etag = '"' + hashlib.md5(body).hexdigest() + '"'
+        response.headers["ETag"] = etag
+        # 内容没变就不重复传整页 HTML（浏览器第二次打开瞬间完成）
+        if request.headers.get("If-None-Match") == etag:
+            response.status_code = 304
+            response.set_data(b"")
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers.pop("Pragma", None)
+            response.headers.pop("Content-Length", None)
+            return response
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers.pop("Pragma", None)
+
+        accept = request.headers.get("Accept-Encoding", "")
+        if "gzip" in accept.lower() and len(body) > 1024:
+            compressed = gzip.compress(body, 6)
+            if len(compressed) < len(body):
+                response.set_data(compressed)
+                response.headers["Content-Encoding"] = "gzip"
+                response.headers["Vary"] = "Accept-Encoding"
     return response
 
 
 @app.get("/")
 def index():
     if not session.get("authed"):
-        return render_template_string(UNLOCK_HTML, error=None)
-    return render_template_string(
-        PAGE_HTML,
-        qr_data_uri=QR_DATA_URI,
+        return _compiled_template(UNLOCK_HTML).render(
+            error=None, url_for=url_for
+        )
+    # 二维码独立成 /qr.png 请求并长期缓存：首页 HTML 不再内嵌几 KB 的 base64 图片，
+    # 第二次打开时浏览器直接用本地缓存的二维码，一毫秒都不用等。
+    qr_version = WEB_QR_ETAG.strip('"')[:10]
+    return _compiled_template(PAGE_HTML).render(
+        qr_url="/qr.png?v=" + qr_version,
+        lan_url=LAN_URL.split("://", 1)[-1],
         max_text_chars=MAX_TEXT_CHARS,
         max_image_bytes=IMAGE_MAX_BYTES,
+        max_image_mb=max(1, round(IMAGE_MAX_BYTES / (1024 * 1024))),
         max_file_bytes=FILE_MAX_BYTES,
+        max_file_mb=max(1, round(FILE_MAX_BYTES / (1024 * 1024))),
     )
+
+
+@app.get("/qr.png")
+def qr_png():
+    """网页展示用二维码。内容不含隐私（和贴墙二维码一样），所以无需密码。"""
+    if request.headers.get("If-None-Match") == WEB_QR_ETAG:
+        response = app.response_class(status=304)
+    else:
+        response = app.response_class(WEB_QR_PNG_BYTES, mimetype="image/png")
+    response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    response.headers["ETag"] = WEB_QR_ETAG
+    return response
 
 
 @app.post("/unlock")
@@ -1993,8 +2904,8 @@ def unlock():
     time.sleep(0.6)
     log.warning("访问密码错误，来源：%s", request.remote_addr)
     # 返回 200 而不是 401，避免个别手机浏览器把 401 当成“网页打不开”。
-    return render_template_string(
-        UNLOCK_HTML, error="密码不对，请重新输入"
+    return _compiled_template(UNLOCK_HTML).render(
+        error="密码不对，请重新输入", url_for=url_for
     )
 
 
@@ -2206,7 +3117,7 @@ def handle_http_error(error: HTTPException):
     if _is_api_request():
         return jsonify(ok=False), error.code or 400
     message = "页面不存在，请返回首页。" if error.code == 404 else "页面出错了，请返回首页重试。"
-    return render_template_string(ERROR_HTML, message=message), error.code or 400
+    return _compiled_template(ERROR_HTML).render(message=message), error.code or 400
 
 
 @app.errorhandler(Exception)
@@ -2215,8 +3126,8 @@ def handle_unexpected_error(error: Exception):
     if _is_api_request():
         return jsonify(ok=False), 500
     return (
-        render_template_string(
-            ERROR_HTML, message="页面出错了，请返回首页重试。"
+        _compiled_template(ERROR_HTML).render(
+            message="页面出错了，请返回首页重试。"
         ),
         500,
     )
@@ -2236,8 +3147,45 @@ def _configure_console() -> None:
             pass
 
 
+def _export_wall_qr_async() -> None:
+    """贴墙二维码生成+写盘放到后台线程，不拖慢“可以扫码”的时间。"""
+    if not EXPORT_QR_IMAGE:
+        return
+
+    def job() -> None:
+        global QR_PNG_BYTES
+        try:
+            png = build_qr_png(LAN_URL, box_size=32)
+            QR_PNG_BYTES = png
+            QR_WALL_PATH.write_bytes(png)
+            print("✅ 墙上二维码图片已导出：" + QR_WALL_FILENAME)
+        except Exception:
+            print("⚠️ 墙上二维码图片导出失败，网页里的二维码仍然可以正常使用。")
+            log.exception("导出 qr_wall.png 失败")
+
+    threading.Thread(target=job, name="qr-wall", daemon=True).start()
+
+
+def _probe_printer_async() -> None:
+    """打印机探测放到后台线程：个别电脑上 spooler 卡顿时也不会拖慢启动。"""
+
+    def job() -> None:
+        try:
+            default_printer = _get_default_printer()
+        except Exception:
+            log.exception("启动时检测默认打印机失败")
+            default_printer = None
+        if default_printer:
+            print("✅ 默认打印机：" + str(default_printer))
+        else:
+            print("⚠️ 警告：没有检测到默认打印机，现在提交会打印失败。")
+            print("   请打开：Windows 设置 → 蓝牙和其他设备 → 打印机和扫描仪，设置默认打印机。")
+
+    threading.Thread(target=job, name="printer-probe", daemon=True).start()
+
+
 def main() -> None:
-    global ACCESS_PASSWORD, LAN_IP, LAN_URL, QR_PNG_BYTES, QR_DATA_URI
+    global ACCESS_PASSWORD, LAN_IP, LAN_URL, WEB_QR_PNG_BYTES, WEB_QR_ETAG
 
     _configure_console()
     ACCESS_PASSWORD = str(ACCESS_PASSWORD)
@@ -2264,72 +3212,53 @@ def main() -> None:
         print("⚠️ 警告：没有检测到内网 IPv4 地址，二维码可能无法被手机打开。")
         print("   请先连接家里 WiFi，或重启本程序；也可以在代码顶部设置 LAN_IP_OVERRIDE。")
 
-    # 3. 生成网页二维码 + 贴墙二维码图片（两者内容完全相同）
+    # 3. 先把端口占住，再做剩下的准备工作。
+    #    这样手机扫码哪怕快了一步，也会在连接队列里等几十毫秒后正常打开，
+    #    而不是撞上“拒绝连接”；同时端口被占用也能第一时间报错。
     try:
-        QR_PNG_BYTES = build_qr_png(LAN_URL)
-        QR_DATA_URI = "data:image/png;base64," + base64.b64encode(
-            QR_PNG_BYTES
-        ).decode("ascii")
+        server = make_server(HOST, PORT, app, threaded=True)
+    except (OSError, SystemExit) as exc:
+        print("❌ 启动失败：端口 " + str(PORT) + " 可能已被占用：" + str(exc))
+        print("请关闭占用该端口的程序，或修改代码顶部的 PORT。")
+        raise SystemExit(1)
+
+    # 4. 网页用小尺寸二维码（几毫秒），贴墙高清二维码丢到后台线程生成
+    try:
+        WEB_QR_PNG_BYTES = build_qr_png(LAN_URL, box_size=12)
+        WEB_QR_ETAG = '"' + hashlib.md5(WEB_QR_PNG_BYTES).hexdigest() + '"'
     except Exception:
+        server.server_close()
         print("❌ 二维码生成失败，请检查 qrcode/Pillow 是否安装正确。")
         log.exception("二维码生成失败")
         raise SystemExit(1)
+    _export_wall_qr_async()
 
-    qr_exported = False
-    if EXPORT_QR_IMAGE:
-        try:
-            QR_WALL_PATH.write_bytes(QR_PNG_BYTES)
-            qr_exported = True
-        except Exception:
-            print("⚠️ 墙上二维码图片导出失败，网页里的二维码仍然可以正常使用。")
-            log.exception("导出 qr_wall.png 失败")
-
-    # 4. 启动时检测默认打印机
-    default_printer = _get_default_printer()
-    if default_printer:
-        printer_ok = True
-    else:
-        printer_ok = False
-        print("⚠️ 警告：没有检测到默认打印机，现在提交会打印失败。")
-        print("   请打开：Windows 设置 → 蓝牙和其他设备 → 打印机和扫描仪，设置默认打印机。")
-
-    # 5. 控制台关键信息
+    # 5. 控制台关键信息（打印机探测在后台进行，结果马上会补一行输出）
     print()
     print("✅ 本机内网访问地址：" + LAN_URL)
-    if EXPORT_QR_IMAGE:
-        if qr_exported:
-            print("✅ 墙上二维码图片已导出：" + QR_WALL_FILENAME)
-        else:
-            print("⚠️ 墙上二维码图片未导出，请查看上面的提示。")
+    if not EXPORT_QR_IMAGE:
+        print("ℹ️ 已关闭贴墙二维码导出（EXPORT_QR_IMAGE = False）。")
     print("✅ 访问密码：" + mask_password(ACCESS_PASSWORD))
-    if printer_ok:
-        print("✅ 默认打印机：" + str(default_printer))
+    _probe_printer_async()
     print("✅ 提示：保持电脑开机、打印机开机才能正常使用")
     print("ℹ️ 首次运行如果手机打不开，请在 Windows 防火墙提示中允许“专用网络”。")
     if ENABLE_FRP_GUIDE:
         print("ℹ️ 外网访问教程在代码末尾注释里；网页只显示内网二维码。")
+    print("ℹ️ 网页服务已就绪，正在后台完成最后的准备工作…")
     print("=" * 60)
     print()
 
-    # 6. 启动唯一打印线程和网页服务
+    # 6. 启动唯一打印线程，然后开始提供网页服务
     worker = threading.Thread(target=_print_worker, name="print-worker", daemon=True)
     worker.start()
 
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     try:
-        app.run(
-            host=HOST,
-            port=PORT,
-            debug=False,
-            threaded=True,
-            use_reloader=False,
-        )
-    except (OSError, SystemExit) as exc:
-        print("❌ 启动失败：端口 " + str(PORT) + " 可能已被占用：" + str(exc))
-        print("请关闭占用该端口的程序，或修改代码顶部的 PORT。")
-        raise SystemExit(1)
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\n程序已停止。")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

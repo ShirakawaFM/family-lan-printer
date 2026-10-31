@@ -32,11 +32,13 @@ This project reduces it to:
 
 ## Preview
 
-> The QR code in the screenshot is a demo link (`http://192.168.1.100:5000`), not a real address.
+> The QR code in the screenshots is a demo link, not a real address.
 
-| Password page | Print page |
-| :---: | :---: |
-| <img src="docs/screenshot-login.png" alt="Password page" width="320" /> | <img src="docs/screenshot-print.png" alt="Text and photo print page" width="320" /> |
+| Password page | Print page (desktop, dark) | Print page (mobile, light) |
+| :---: | :---: | :---: |
+| <img src="docs/screenshot-login.png" alt="Password page" width="260" /> | <img src="docs/screenshot-print.png" alt="Desktop print page" width="420" /> | <img src="docs/screenshot-print-mobile.png" alt="Mobile print page" width="230" /> |
+
+The UI uses a modern, motion-rich style: dark/light themes (follows the system, manual toggle included), gradient glow background, glassy cards, tabbed print modes and spring micro-interactions. A ~1 s branded splash animation plays on the print page and fades out as soon as the page is ready. Buttons stay large and full-width (56 px tall, 16 px+ font) so touch use by kids and grandparents is unaffected.
 
 ## Features
 
