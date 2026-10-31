@@ -1,0 +1,19 @@
+# frpc.toml 模板
+# 把所有 （） 内容替换成真实值，删除括号。
+# 手动运行时：frpc.exe -c frpc.toml
+
+serverAddr = "（云服务器公网 IP）"
+serverPort = （frp 控制端口，默认 7000）
+auth.method = "token"
+auth.token = "（frp token，同服务器）"
+
+log.to = "frpc.log"
+log.level = "info"
+log.maxDays = 3
+
+[[proxies]]
+name = "family-print"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = （本机打印服务端口，默认 5000）
+remotePort = （外网访问端口，默认 6000）
