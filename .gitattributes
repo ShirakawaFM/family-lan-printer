@@ -1,0 +1,6 @@
+# Keep shell scripts LF so they run on Linux after download.
+*.sh text eol=lf
+# Windows scripts stay CRLF; PowerShell 5.1 handles the UTF-8 BOM.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.toml text eol=lf

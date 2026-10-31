@@ -161,6 +161,13 @@ try {
     Write-Warning "本机打印服务暂时没起来。请先手动运行 print_server.py 看错误，或检查端口 $LocalPort。"
 }
 
+Start-Sleep -Seconds 2
+if (Get-Process -Name "frpc" -ErrorAction SilentlyContinue) {
+    Write-Host "✅ frpc 已启动" -ForegroundColor Green
+} else {
+    Write-Warning "frpc 没有保持运行。请查看 $FrpDir\frpc.log，重点检查 token、服务器 IP 和端口。"
+}
+
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "✅ 家里电脑配置完成" -ForegroundColor Green
