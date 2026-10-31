@@ -1,0 +1,9 @@
+# Caddyfile 模板
+# 把所有 （） 替换成真实值，删除括号。
+# 保存到 /etc/caddy/Caddyfile，然后：
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+
+（你的域名） {
+    reverse_proxy 127.0.0.1:（外网访问端口，默认 6000）
+}
